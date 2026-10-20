@@ -55,7 +55,7 @@ class TrafficService : Service() {
     override fun onCreate() {
         super.onCreate()
         scheduler = Executors.newSingleThreadScheduledExecutor()
-        workers = Executors.newFixedThreadPool(3)
+        workers = Executors.newFixedThreadPool(6)
         createChannel()
 
         val filter = IntentFilter().apply {
@@ -152,6 +152,7 @@ class TrafficService : Service() {
     private fun applyExtras(intent: Intent) {
         Traffic.interval = intent.getIntExtra("interval", Traffic.interval).coerceIn(3, 3600)
         Traffic.jitter = intent.getIntExtra("jitter", Traffic.jitter).coerceIn(0, 600)
+        Traffic.burst = intent.getIntExtra("burst", Traffic.burst).coerceIn(1, 6)
         Traffic.targets = Traffic.parseTargets(intent.getStringExtra("targets"))
     }
 
@@ -174,11 +175,14 @@ class TrafficService : Service() {
 
     private fun tick() {
         if (!Traffic.running || !Traffic.screenOn) return
-        val url = nextTarget()
-        workers.execute {
-            val r = Traffic.fetch(url)
-            Traffic.record(url, r)
-            updateNotification()
+        // 一次唤醒里连发 burst 个请求：唤醒次数不变、流量翻倍，比「多发几次唤醒」省电
+        repeat(Traffic.burst.coerceIn(1, 6)) {
+            val url = nextTarget()
+            workers.execute {
+                val r = Traffic.fetch(url)
+                Traffic.record(url, r)
+                updateNotification()
+            }
         }
         scheduleNext()
     }
@@ -297,6 +301,7 @@ class TrafficService : Service() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putInt("interval", Traffic.interval)
             .putInt("jitter", Traffic.jitter)
+            .putInt("burst", Traffic.burst)
             .putString("targets", JSONArray(Traffic.targets).toString())
             .putBoolean("running", Traffic.running)
             .apply()
@@ -306,6 +311,7 @@ class TrafficService : Service() {
         val sp = getSharedPreferences(PREFS, MODE_PRIVATE)
         Traffic.interval = sp.getInt("interval", 30).coerceIn(3, 3600)
         Traffic.jitter = sp.getInt("jitter", 0).coerceIn(0, 600)
+        Traffic.burst = sp.getInt("burst", 2).coerceIn(1, 6)
         Traffic.targets = Traffic.parseTargets(sp.getString("targets", null))
         Traffic.running = sp.getBoolean("running", false)
         if (Traffic.running && Traffic.startedAt == 0L) Traffic.resetStats()

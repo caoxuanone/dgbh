@@ -64,6 +64,17 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        webView.evaluateJavascript("window.__dashVisible && window.__dashVisible(true)", null)
+    }
+
+    override fun onStop() {
+        // 页面切后台就停掉每秒轮询，省电；访问循环在服务里不受影响
+        webView.evaluateJavascript("window.__dashVisible && window.__dashVisible(false)", null)
+        super.onStop()
+    }
+
     override fun onDestroy() {
         try {
             webView.removeJavascriptInterface("AndroidBridge")
@@ -80,11 +91,12 @@ class MainActivity : Activity() {
         fun snapshot(): String = Traffic.snapshotJson()
 
         @JavascriptInterface
-        fun start(interval: Int, jitter: Int, targetsJson: String) {
+        fun start(interval: Int, jitter: Int, burst: Int, targetsJson: String) {
             val i = Intent(this@MainActivity, TrafficService::class.java).apply {
                 action = TrafficService.ACTION_START
                 putExtra("interval", interval)
                 putExtra("jitter", jitter)
+                putExtra("burst", burst)
                 putExtra("targets", targetsJson)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
@@ -100,13 +112,14 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
-        fun applyConfig(interval: Int, jitter: Int, targetsJson: String) {
+        fun applyConfig(interval: Int, jitter: Int, burst: Int, targetsJson: String) {
             if (!Traffic.running) return
             startService(
                 Intent(this@MainActivity, TrafficService::class.java).apply {
                     action = TrafficService.ACTION_APPLY
                     putExtra("interval", interval)
                     putExtra("jitter", jitter)
+                    putExtra("burst", burst)
                     putExtra("targets", targetsJson)
                 }
             )

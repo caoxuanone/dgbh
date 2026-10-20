@@ -141,6 +141,7 @@
       <div class="row">
         <label class="field"><span>间隔（秒）</span><input id="interval" type="number" min="3" max="3600" step="1" value="30"></label>
         <label class="field"><span>随机抖动（秒，±）</span><input id="jitter" type="number" min="0" max="600" step="1" value="0"></label>
+        <label class="field"><span>每轮请求数（省电＝少而多）</span><input id="burst" type="number" min="1" max="6" step="1" value="2"></label>
       </div>
 
       <label class="switch"><input type="checkbox" id="preview" checked> 开独立访问窗口（真实加载整页，流量主要来源）</label>
@@ -221,7 +222,7 @@
   const el = {
     dot: $("dot"), statusText: $("statusText"), modePill: $("modePill"),
     stHits: $("stHits"), stBytes: $("stBytes"), stRate: $("stRate"), stUptime: $("stUptime"),
-    interval: $("interval"), jitter: $("jitter"), preview: $("preview"), targets: $("targets"),
+    interval: $("interval"), jitter: $("jitter"), burst: $("burst"), preview: $("preview"), targets: $("targets"),
     btnToggle: $("btnToggle"), btnOnce: $("btnOnce"), btnApply: $("btnApply"), btnReset: $("btnReset"),
     logBody: $("logBody"), viewerState: $("viewerState"), viewerDot: $("viewerDot"),
     btnViewer: $("btnViewer"), previewUrl: $("previewUrl")
@@ -243,7 +244,7 @@
   };
 
   function loadCfg() {
-    let cfg = { interval: 30, jitter: 0, preview: true, targets: DEFAULT_TARGETS.slice() };
+    let cfg = { interval: 30, jitter: 0, burst: 2, preview: true, targets: DEFAULT_TARGETS.slice() };
     try {
       const raw = localStorage.getItem(CFG_KEY);
       if (raw) Object.assign(cfg, JSON.parse(raw));
@@ -258,6 +259,7 @@
   function saveCfg() {
     cfg.interval = clamp(num(el.interval.value, 30), 3, 3600);
     cfg.jitter = clamp(num(el.jitter.value, 0), 0, 600);
+    cfg.burst = clamp(num(el.burst.value, 2), 1, 6);
     cfg.preview = el.preview.checked;
     cfg.targets = parseTargets(el.targets.value);
     state.bag = [];
@@ -280,6 +282,7 @@
   function fillForm() {
     el.interval.value = cfg.interval;
     el.jitter.value = cfg.jitter;
+    el.burst.value = cfg.burst || 1;
     el.preview.checked = cfg.preview !== false;
     el.targets.value = cfg.targets.join("\n");
   }
@@ -384,7 +387,6 @@
   }
 
   // ---------- 安卓原生模式：循环在前台服务里，页面只做展示 ----------
-  let nativeTimer = null;
   let nativeRunning = false;
 
   function bridge(method, ...args) {
@@ -404,7 +406,9 @@
     if (note) {
       note.innerHTML =
         "<b>后台模式：</b>访问循环跑在 App 的前台服务里，用原生 HTTP 直接请求，切到别的 App 也能继续；" +
-        "锁屏自动暂停，亮屏自动继续。状态栏通知里的「停止」可以随时叫停。";
+        "锁屏自动暂停，亮屏自动继续。状态栏通知里的「停止」可以随时叫停。" +
+        "<br><b>省电：</b>把间隔调到 60 秒、每轮请求数保持 2 —— 流量和原来一样，但射频唤醒次数减半。" +
+        "间隔越长越省电，因为每次唤醒都要叫醒手机无线电并空转几秒。";
     }
     const bar = document.querySelector(".btns");
     if (bar && !document.getElementById("btnBg")) {
@@ -418,12 +422,21 @@
   }
 
   function pollNative() {
-    clearTimeout(nativeTimer);
+    if (!NATIVE) return;
     let s = null;
     try { s = JSON.parse(bridge("snapshot") || "null"); } catch (_) {}
     if (s) applyNative(s);
-    nativeTimer = setTimeout(pollNative, 1000);
   }
+
+  // 页面不可见（切到别的 App / 锁屏）就停止每秒轮询，省电
+  let dashVisible = true;
+  window.__dashVisible = function (on) {
+    dashVisible = !!on;
+    if (dashVisible) pollNative();
+  };
+  document.addEventListener("visibilitychange", () => {
+    window.__dashVisible(!document.hidden);
+  });
 
   function applyNative(s) {
     nativeRunning = !!s.running;
@@ -449,6 +462,7 @@
       if (!localStorage.getItem(CFG_KEY) && Array.isArray(s.targets) && s.targets.length) {
         cfg.targets = s.targets;
         if (typeof s.interval === "number") cfg.interval = s.interval;
+        if (typeof s.burst === "number") cfg.burst = s.burst;
         fillForm();
       }
     }
@@ -485,13 +499,13 @@
   function nativeToggle() {
     saveCfg();
     if (nativeRunning) bridge("stop");
-    else bridge("start", cfg.interval, cfg.jitter, JSON.stringify(cfg.targets));
+    else bridge("start", cfg.interval, cfg.jitter, cfg.burst, JSON.stringify(cfg.targets));
     setTimeout(pollNative, 300);
   }
 
   function nativeApply() {
     saveCfg();
-    bridge("applyConfig", cfg.interval, cfg.jitter, JSON.stringify(cfg.targets));
+    bridge("applyConfig", cfg.interval, cfg.jitter, cfg.burst, JSON.stringify(cfg.targets));
   }
 
   function openViewer(url) {
@@ -677,9 +691,10 @@
     if (state.running) scheduleNext();
   });
 
-  // 倒计时刷新 + 运行时长
+  // 倒计时刷新 + 运行时长（页面不可见时整个跳过，不做任何事）
   setInterval(() => {
-    if (NATIVE) { renderStats(); return; }
+    if (!dashVisible) return;
+    if (NATIVE) { pollNative(); return; }
     renderStats();
     renderViewer();
     if (state.running && state.nextAt) {

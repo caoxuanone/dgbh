@@ -47,6 +47,7 @@ object Traffic {
     @Volatile var startedAt = 0L
     @Volatile var interval = 30
     @Volatile var jitter = 0
+    @Volatile var burst = 2
     @Volatile var targets: List<String> = DEFAULT_TARGETS
 
     private val log = ArrayDeque<String>()
@@ -97,6 +98,7 @@ object Traffic {
         o.put("bytes", bytes)
         o.put("interval", interval)
         o.put("jitter", jitter)
+        o.put("burst", burst)
         o.put(
             "uptimeMs",
             if (running && startedAt > 0) System.currentTimeMillis() - startedAt else 0L
