@@ -50,6 +50,19 @@ object Traffic {
     @Volatile var burst = 1
     @Volatile var targets: List<String> = DEFAULT_TARGETS
 
+    // ---- 逐域名测试 ----
+    @Volatile var probing = false
+    @Volatile var probeIndex = 0
+    @Volatile var probeTotal = 0
+    @Volatile var probeCurrent = ""
+    @Volatile var probeDoneAt = 0L
+    @Volatile var keepMbps = 5.0
+    @Volatile var dropMbps = 0.5
+    @Volatile var targetsVersion = 0
+
+    private val probeResults = ArrayDeque<String>()
+    private val probeLock = Any()
+
     private val log = ArrayDeque<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.CHINA)
 
@@ -107,7 +120,101 @@ object Traffic {
         synchronized(log) { for (line in log) arr.put(JSONObject(line)) }
         o.put("log", arr)
         o.put("targets", JSONArray(targets))
+        o.put("targetsVersion", targetsVersion)
+        o.put("probe", probeJson())
         return o.toString()
+    }
+
+    // ---------- 逐域名测试 ----------
+
+    fun probeReset(total: Int) {
+        synchronized(probeLock) { probeResults.clear() }
+        probing = true
+        probeIndex = 0
+        probeTotal = total
+        probeCurrent = ""
+        probeDoneAt = 0L
+    }
+
+    fun probeAdd(url: String, status: Int, mbps: Double, verdict: String) {
+        val o = JSONObject()
+            .put("url", url)
+            .put("status", status)
+            .put("mbps", Math.round(mbps * 10.0) / 10.0)
+            .put("verdict", verdict)
+        synchronized(probeLock) { probeResults.addLast(o.toString()) }
+    }
+
+    fun probeVerdicts(): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        synchronized(probeLock) {
+            for (line in probeResults) {
+                val o = JSONObject(line)
+                out.add(o.optString("url") to o.optString("verdict"))
+            }
+        }
+        return out
+    }
+
+    fun probeJson(): JSONObject {
+        val p = JSONObject()
+            .put("running", probing)
+            .put("index", probeIndex)
+            .put("total", probeTotal)
+            .put("current", probeCurrent)
+            .put("doneAt", probeDoneAt)
+            .put("keep", keepMbps)
+            .put("drop", dropMbps)
+        val arr = JSONArray()
+        synchronized(probeLock) { for (line in probeResults) arr.put(JSONObject(line)) }
+        p.put("results", arr)
+        return p
+    }
+
+    /**
+     * 下载约 3MB，测下行速率，单位 Mbps；失败返回 0。
+     * 用站点自己的 565KB 静态资源重复拉取，避免依赖第三方测速站。
+     */
+    fun speedTest(): Double {
+        val url = "https://www.10099.com.cn/js/common-85ed7.js"
+        val started = System.currentTimeMillis()
+        val limitMs = 8000L
+        val targetBytes = 3_000_000L
+        var bytes = 0L
+        var round = 0
+
+        while (round < 8 && bytes < targetBytes && System.currentTimeMillis() - started < limitMs) {
+            round++
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 8000
+                    readTimeout = 8000
+                    useCaches = false
+                    setRequestProperty("Cache-Control", "no-cache")
+                    setRequestProperty("User-Agent", UA)
+                }
+                val buf = ByteArray(32 * 1024)
+                conn.inputStream.use { stream ->
+                    while (true) {
+                        val n = stream.read(buf)
+                        if (n <= 0) break
+                        bytes += n
+                        if (bytes >= targetBytes) break
+                        if (System.currentTimeMillis() - started >= limitMs) break
+                    }
+                }
+            } catch (_: Exception) {
+                // 这一轮失败就结束，用已经拿到的字节数算
+                break
+            } finally {
+                conn?.disconnect()
+            }
+        }
+
+        val sec = (System.currentTimeMillis() - started) / 1000.0
+        if (sec < 0.2 || bytes < 100_000L) return 0.0
+        return bytes * 8.0 / sec / 1_000_000.0
     }
 
     fun fetch(url: String): Result {

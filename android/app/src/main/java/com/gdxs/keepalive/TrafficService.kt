@@ -32,6 +32,8 @@ class TrafficService : Service() {
         const val ACTION_STOP = "com.gdxs.keepalive.STOP"
         const val ACTION_APPLY = "com.gdxs.keepalive.APPLY"
         const val ACTION_HIT_ONCE = "com.gdxs.keepalive.HIT_ONCE"
+        const val ACTION_PROBE = "com.gdxs.keepalive.PROBE"
+        const val ACTION_PROBE_STOP = "com.gdxs.keepalive.PROBE_STOP"
 
         private const val CHANNEL_ID = "keepalive"
         private const val NOTIF_ID = 1001
@@ -40,6 +42,7 @@ class TrafficService : Service() {
 
     private lateinit var scheduler: ScheduledExecutorService
     private lateinit var workers: ExecutorService
+    private lateinit var probeWorker: ExecutorService
     private var pending: ScheduledFuture<*>? = null
     private val bag = ArrayList<String>()
 
@@ -56,6 +59,7 @@ class TrafficService : Service() {
         super.onCreate()
         scheduler = Executors.newSingleThreadScheduledExecutor()
         workers = Executors.newFixedThreadPool(6)
+        probeWorker = Executors.newSingleThreadExecutor()
         createChannel()
 
         val filter = IntentFilter().apply {
@@ -120,6 +124,24 @@ class TrafficService : Service() {
                 hitOnce(list)
             }
 
+            ACTION_PROBE -> {
+                Traffic.keepMbps = intent.getDoubleExtra("keep", 5.0)
+                Traffic.dropMbps = intent.getDoubleExtra("drop", 0.5)
+                val list = Traffic.parseTargets(intent.getStringExtra("targets"))
+                startForegroundCompat()
+                pending?.cancel(false)
+                pending = null
+                startProbe(list)
+            }
+
+            ACTION_PROBE_STOP -> {
+                Traffic.probing = false
+                if (!Traffic.running) {
+                    stopForeground(true)
+                    stopSelf()
+                }
+            }
+
             else -> {
                 restore()
                 if (Traffic.running) {
@@ -144,6 +166,7 @@ class TrafficService : Service() {
         }
         scheduler.shutdownNow()
         workers.shutdownNow()
+        probeWorker.shutdownNow()
         super.onDestroy()
     }
 
@@ -174,7 +197,7 @@ class TrafficService : Service() {
     }
 
     private fun tick() {
-        if (!Traffic.running || !Traffic.screenOn) return
+        if (!Traffic.running || !Traffic.screenOn || Traffic.probing) return
         // 一次唤醒里连发 burst 个请求：唤醒次数不变、流量翻倍，比「多发几次唤醒」省电
         repeat(Traffic.burst.coerceIn(1, 6)) {
             val url = nextTarget()
@@ -198,6 +221,74 @@ class TrafficService : Service() {
             if (u in list) return u
         }
         return list.random()
+    }
+
+    // ---------- 逐域名测试 ----------
+
+    private fun startProbe(list: List<String>) {
+        if (Traffic.probing) return
+        val targets = if (list.isEmpty()) Traffic.DEFAULT_TARGETS else list
+        Traffic.probeReset(targets.size)
+        updateNotification()
+
+        probeWorker.execute {
+            try {
+                for (i in targets.indices) {
+                    if (!Traffic.probing) break
+                    val url = targets[i]
+                    Traffic.probeIndex = i + 1
+                    Traffic.probeCurrent = url
+                    updateNotification()
+
+                    val r = Traffic.fetch(url)
+                    Traffic.record(url, r)
+
+                    if (r.status !in 200..399) {
+                        Traffic.probeAdd(url, r.status, 0.0, "fail")
+                        continue
+                    }
+
+                    // 访问成功后等 10 秒再测速
+                    var waited = 0
+                    while (waited < 10_000 && Traffic.probing) {
+                        Thread.sleep(500)
+                        waited += 500
+                    }
+                    if (!Traffic.probing) break
+
+                    val mbps = Traffic.speedTest()
+                    val verdict = when {
+                        mbps >= Traffic.keepMbps -> "keep"
+                        mbps <= Traffic.dropMbps -> "drop"
+                        else -> "maybe"
+                    }
+                    Traffic.probeAdd(url, r.status, mbps, verdict)
+                    updateNotification()
+                }
+            } catch (_: InterruptedException) {
+            } finally {
+                // 低于删除阈值的域名从目标清单里移除
+                val drops = Traffic.probeVerdicts()
+                    .filter { it.second == "drop" }
+                    .map { it.first }
+                if (drops.isNotEmpty()) {
+                    Traffic.targets = Traffic.targets.filter { it !in drops }
+                    Traffic.targetsVersion++
+                }
+                Traffic.probing = false
+                Traffic.probeCurrent = ""
+                Traffic.probeDoneAt = System.currentTimeMillis()
+                save()
+
+                if (Traffic.running) {
+                    updateNotification()
+                    scheduleNext(1500)
+                } else {
+                    stopForeground(true)
+                    stopSelf()
+                }
+            }
+        }
     }
 
     private fun hitOnce(list: List<String>) {
@@ -257,13 +348,16 @@ class TrafficService : Service() {
             Intent(this, TrafficService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val title = if (Traffic.probing) "广电保活 · 域名测试中" else "广电保活 · 后台运行中"
         val text = when {
+            Traffic.probing ->
+                "${Traffic.probeIndex}/${Traffic.probeTotal} · ${Traffic.probeCurrent.removePrefix("https://").take(36)}"
             !Traffic.running -> "已停止"
             !Traffic.screenOn -> "屏幕已锁 · 已暂停"
             else -> "已访问 ${Traffic.hits} 次 · ${fmtBytes(Traffic.bytes)}"
         }
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("广电保活 · 后台运行中")
+            .setContentTitle(title)
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_stat_keepalive)
             .setOngoing(true)

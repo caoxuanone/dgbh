@@ -136,6 +136,25 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun startProbe(targetsJson: String, keep: Double, drop: Double) {
+            val i = Intent(this@MainActivity, TrafficService::class.java).apply {
+                action = TrafficService.ACTION_PROBE
+                putExtra("targets", targetsJson)
+                putExtra("keep", keep)
+                putExtra("drop", drop)
+            }
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        }
+
+        @JavascriptInterface
+        fun stopProbe() {
+            startService(
+                Intent(this@MainActivity, TrafficService::class.java)
+                    .setAction(TrafficService.ACTION_PROBE_STOP)
+            )
+        }
+
+        @JavascriptInterface
         fun openBatterySettings() {
             runOnUiThread { showBatterySettings() }
         }
