@@ -1,0 +1,12 @@
+{
+  "name": "gdxs-keepalive",
+  "version": "1.0.0",
+  "private": true,
+  "description": "每 N 秒随机访问广电页面，保持网络活跃（纯静态网页 + 可选本地统计服务）",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.64.1"
+  }
+}
