@@ -125,10 +125,10 @@ class TrafficService : Service() {
             }
 
             ACTION_PROBE -> {
-                Traffic.keepMbps = intent.getDoubleExtra("keep", 5.0)
-                Traffic.dropMbps = intent.getDoubleExtra("drop", 0.5)
+                Traffic.upRatio = intent.getDoubleExtra("up", 1.5)
+                Traffic.downRatio = intent.getDoubleExtra("down", 0.67)
                 Traffic.probeGap = intent.getIntExtra("gap", 90).coerceIn(0, 600)
-                Traffic.speedSource = intent.getStringExtra("src") ?: "gdxs"
+                Traffic.speedSource = intent.getStringExtra("src") ?: "public"
                 val list = Traffic.parseTargets(intent.getStringExtra("targets"))
                 startForegroundCompat()
                 pending?.cancel(false)
@@ -236,7 +236,8 @@ class TrafficService : Service() {
         }
     }
 
-    private fun startProbe(list: List<String>) {        if (Traffic.probing) return
+    private fun startProbe(list: List<String>) {
+        if (Traffic.probing) return
         val targets = if (list.isEmpty()) Traffic.DEFAULT_TARGETS else list
         Traffic.probeReset(targets.size)
         updateNotification()
@@ -248,45 +249,55 @@ class TrafficService : Service() {
                     val url = targets[i]
                     Traffic.probeIndex = i + 1
                     Traffic.probeCurrent = url
-                    updateNotification()
 
+                    // 1. 基线：访问之前先测 30 秒
+                    Traffic.probePhase = "基线测速 30 秒…"
+                    updateNotification()
+                    val base = Traffic.speedTest(Traffic.speedSource, 30, url)
+                    if (!Traffic.probing) break
+
+                    // 2. 访问
+                    Traffic.probePhase = "访问中…"
+                    updateNotification()
                     val r = Traffic.fetch(url)
                     Traffic.record(url, r)
 
                     if (r.status !in 200..399) {
-                        Traffic.probeAdd(url, r.status, 0.0, "fail")
+                        Traffic.probeAdd(url, r.status, base.mbps, 0.0, 0.0, emptyList(), "fail")
+                        updateNotification()
                     } else {
-                        // 访问成功后等 10 秒再测速
+                        // 3. 等 10 秒，让访问的影响显出来
+                        Traffic.probePhase = "等待 10 秒…"
+                        updateNotification()
                         sleepWhileProbing(10_000)
                         if (!Traffic.probing) break
 
-                        val mbps = Traffic.speedTest()
+                        // 4. 复测
+                        Traffic.probePhase = "复测 30 秒…"
+                        updateNotification()
+                        val after = Traffic.speedTest(Traffic.speedSource, 30, url)
+                        val ratio =
+                            if (base.mbps > 0.5 && after.mbps > 0.0) after.mbps / base.mbps else 0.0
                         val verdict = when {
-                            mbps >= Traffic.keepMbps -> "keep"
-                            mbps <= Traffic.dropMbps -> "drop"
-                            else -> "maybe"
+                            ratio <= 0.0 -> "fail"
+                            ratio >= Traffic.upRatio -> "up"
+                            ratio <= Traffic.downRatio -> "down"
+                            else -> "same"
                         }
-                        Traffic.probeAdd(url, r.status, mbps, verdict)
+                        Traffic.probeAdd(url, r.status, base.mbps, after.mbps, ratio, after.seg, verdict)
                         updateNotification()
                     }
 
-                    // 测速完成后等一会儿，再测下一个（让网络状态回落到基线）
+                    // 5. 冷却，让网络状态回落
                     if (i < targets.lastIndex) {
-                        Traffic.probeCurrent = "等待 ${Traffic.probeGap} 秒…"
+                        Traffic.probePhase = "等待 ${Traffic.probeGap} 秒…"
                         updateNotification()
                         sleepWhileProbing(Traffic.probeGap * 1000)
                     }
                 }
             } catch (_: InterruptedException) {
             } finally {
-                // 低于删除阈值的域名从目标清单里移除
-                val drops = Traffic.probeVerdicts()
-                    .filter { it.second == "drop" }
-                    .map { it.first }
-                if (drops.isNotEmpty()) {
-                    Traffic.targets = Traffic.targets.filter { it !in drops }
-                    Traffic.targetsVersion++
-                }
+                Traffic.probePhase = ""
                 Traffic.probing = false
                 Traffic.probeCurrent = ""
                 Traffic.probeDoneAt = System.currentTimeMillis()
@@ -363,7 +374,8 @@ class TrafficService : Service() {
         val title = if (Traffic.probing) "广电保活 · 域名测试中" else "广电保活 · 后台运行中"
         val text = when {
             Traffic.probing ->
-                "${Traffic.probeIndex}/${Traffic.probeTotal} · ${Traffic.probeCurrent.removePrefix("https://").take(36)}"
+                "${Traffic.probeIndex}/${Traffic.probeTotal} · " +
+                    Traffic.probePhase.ifEmpty { Traffic.probeCurrent.removePrefix("https://") }.take(36)
             !Traffic.running -> "已停止"
             !Traffic.screenOn -> "屏幕已锁 · 已暂停"
             else -> "已访问 ${Traffic.hits} 次 · ${fmtBytes(Traffic.bytes)}"

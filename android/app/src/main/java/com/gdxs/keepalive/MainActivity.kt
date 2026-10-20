@@ -136,12 +136,12 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
-        fun startProbe(targetsJson: String, keep: Double, drop: Double, gap: Int, src: String) {
+        fun startProbe(targetsJson: String, up: Double, down: Double, gap: Int, src: String) {
             val i = Intent(this@MainActivity, TrafficService::class.java).apply {
                 action = TrafficService.ACTION_PROBE
                 putExtra("targets", targetsJson)
-                putExtra("keep", keep)
-                putExtra("drop", drop)
+                putExtra("up", up)
+                putExtra("down", down)
                 putExtra("gap", gap)
                 putExtra("src", src)
             }

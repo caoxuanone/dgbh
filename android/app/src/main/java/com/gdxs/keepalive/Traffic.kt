@@ -9,7 +9,9 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicLongArray
 
 /**
  * 全局运行状态 + HTTP 请求实现。
@@ -53,27 +55,42 @@ object Traffic {
     @Volatile var burst = 1
     @Volatile var targets: List<String> = DEFAULT_TARGETS
 
-    // ---- 逐域名测试 ----
+    // ---- 域名对比测试 ----
     @Volatile var probing = false
     @Volatile var probeIndex = 0
     @Volatile var probeTotal = 0
     @Volatile var probeCurrent = ""
+    @Volatile var probePhase = ""
     @Volatile var probeDoneAt = 0L
-    @Volatile var keepMbps = 5.0
-    @Volatile var dropMbps = 0.5
+    @Volatile var upRatio = 1.5
+    @Volatile var downRatio = 0.67
     @Volatile var probeGap = 90
-    @Volatile var speedSource = "gdxs"
+    @Volatile var speedSource = "public"
     @Volatile var targetsVersion = 0
 
     private val probeResults = ArrayDeque<String>()
     private val probeLock = Any()
 
-    /** 测速源。公共镜像大多对单 IP 限速，只作对照。 */
+    /** 测速源。public = speedtest.im 的公开下载源清单（国内 CDN 大文件）。 */
     val SPEED_SOURCES = mapOf(
         "gdxs" to "https://www.10099.com.cn/js/common-85ed7.js",
         "tencent" to "https://mirrors.cloud.tencent.com/ubuntu/ls-lR.gz",
         "huawei" to "https://mirrors.huaweicloud.com/ubuntu/ls-lR.gz"
     )
+
+    private const val PUBLIC_CATALOG = "https://speedtest.im/api/download_sources.php"
+    // 只有 1、2 这两个池是下载源；U1 是 Ookla 的上传端点
+    private val PUBLIC_POOLS = listOf("1", "2")
+    private const val MIN_FILE_BYTES = 20L * 1024 * 1024
+
+    @Volatile private var healthyUrls: List<String> = emptyList()
+    @Volatile private var healthyAt = 0L
+    private val fileQueue = ArrayDeque<String>()
+    private val pinned = HashMap<String, List<String>>()
+    private val badFiles = HashMap<String, Long>()
+    private val publicLock = Any()
+
+    data class SpeedSample(val mbps: Double, val seg: List<Double>, val bytes: Long)
 
     private val log = ArrayDeque<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.CHINA)
@@ -148,11 +165,22 @@ object Traffic {
         probeDoneAt = 0L
     }
 
-    fun probeAdd(url: String, status: Int, mbps: Double, verdict: String) {
+    fun probeAdd(
+        url: String,
+        status: Int,
+        base: Double,
+        after: Double,
+        ratio: Double,
+        seg: List<Double>,
+        verdict: String
+    ) {
         val o = JSONObject()
             .put("url", url)
             .put("status", status)
-            .put("mbps", Math.round(mbps * 10.0) / 10.0)
+            .put("base", Math.round(base * 10.0) / 10.0)
+            .put("after", Math.round(after * 10.0) / 10.0)
+            .put("ratio", Math.round(ratio * 100.0) / 100.0)
+            .put("seg", JSONArray(seg.map { Math.round(it * 10.0) / 10.0 }))
             .put("verdict", verdict)
         synchronized(probeLock) { probeResults.addLast(o.toString()) }
     }
@@ -173,77 +201,95 @@ object Traffic {
             .put("running", probing)
             .put("index", probeIndex)
             .put("total", probeTotal)
-            .put("current", probeCurrent)
+            .put("current", probePhase.ifEmpty { probeCurrent })
             .put("doneAt", probeDoneAt)
-            .put("keep", keepMbps)
-            .put("drop", dropMbps)
+            .put("up", upRatio)
+            .put("down", downRatio)
         val arr = JSONArray()
         synchronized(probeLock) { for (line in probeResults) arr.put(JSONObject(line)) }
         p.put("results", arr)
         return p
     }
 
-    /**
-     * 测下行速率，单位 Mbps；失败返回 0。
-     * 4 个并发连接拉同一个源，最多 4MB 或 6 秒——单连接受 TCP 慢启动影响，波动很大。
-     */
-    fun speedTest(src: String = speedSource): Double {
-        val url = SPEED_SOURCES[src] ?: SPEED_SOURCES.getValue("gdxs")
-        val started = System.currentTimeMillis()
-        val limitMs = 6000L
-        val cap = 4_000_000L
-        val total = AtomicLong(0)
-        val pool = Executors.newFixedThreadPool(4)
+    // ---------- 公共测速源 ----------
 
+    private fun isBad(u: String): Boolean {
+        val t = synchronized(publicLock) { badFiles[u] } ?: return false
+        if (System.currentTimeMillis() - t > 30 * 60 * 1000) {
+            synchronized(publicLock) { badFiles.remove(u) }
+            return false
+        }
+        return true
+    }
+
+    private fun markBad(u: String) {
+        synchronized(publicLock) { badFiles[u] = System.currentTimeMillis() }
+    }
+
+    /** 拉清单 + 逐个体检（Range 取 2 字节，确认真的能下），缓存 10 分钟 */
+    fun publicSources(): List<String> {
+        val now = System.currentTimeMillis()
+        val cached = healthyUrls
+        if (cached.isNotEmpty() && now - healthyAt < 10 * 60 * 1000) return cached
+
+        val raw = ArrayList<String>()
+        var conn: HttpURLConnection? = null
         try {
-            val futures = (0 until 4).map { idx ->
-                pool.submit {
-                    var pos = idx * 1_048_576L
-                    while (total.get() < cap && System.currentTimeMillis() - started < limitMs) {
-                        var conn: HttpURLConnection? = null
-                        try {
-                            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                                connectTimeout = 6000
-                                readTimeout = 6000
-                                useCaches = false
-                                setRequestProperty("Cache-Control", "no-cache")
-                                setRequestProperty("User-Agent", UA)
-                                setRequestProperty("Range", "bytes=$pos-${pos + 1_048_575L}")
-                            }
-                            val code = conn.responseCode
-                            // 文件比 Range 短（比如 565KB 的 js）：从头重下
-                            if (code == 416) {
-                                pos = 0L
-                                continue
-                            }
-                            if (code < 200 || code >= 300) break
-
-                            var read = 0L
-                            val buf = ByteArray(32 * 1024)
-                            conn.inputStream.use { stream ->
-                                while (true) {
-                                    val n = stream.read(buf)
-                                    if (n <= 0) break
-                                    read += n
-                                    total.addAndGet(n.toLong())
-                                    if (total.get() >= cap) break
-                                    if (System.currentTimeMillis() - started >= limitMs) break
-                                }
-                            }
-                            // 206 支持分段，往后接着拉；200 是整文件，下一轮从头
-                            pos = if (code == 206) pos + read else 0L
-                            if (read == 0L) break
-                        } catch (_: Exception) {
-                            break
-                        } finally {
-                            conn?.disconnect()
+            val c = (URL(PUBLIC_CATALOG).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10000
+                readTimeout = 12000
+                useCaches = false
+                setRequestProperty("User-Agent", UA)
+                setRequestProperty("Referer", "https://speedtest.im/")
+            }
+            conn = c
+            val txt = c.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8)
+            val j = JSONObject(txt)
+            val pools = j.optJSONObject("healthTokens") ?: j.optJSONObject("downloadSourcePools")
+            if (pools != null) {
+                for (k in PUBLIC_POOLS) {
+                    val v = pools.opt(k) ?: continue
+                    if (v is JSONObject) {
+                        val keys = v.keys()
+                        while (keys.hasNext()) {
+                            val u = keys.next()
+                            if (u.startsWith("http")) raw.add(u)
+                        }
+                    } else if (v is JSONArray) {
+                        for (i in 0 until v.length()) {
+                            val u = v.optString(i)
+                            if (u.startsWith("http")) raw.add(u)
                         }
                     }
                 }
             }
+        } catch (_: Exception) {
+        } finally {
+            conn?.disconnect()
+        }
+        if (raw.isEmpty()) return cached
+
+        // 体检：并发 12，整体最多 15 秒
+        val found = java.util.Collections.synchronizedList(ArrayList<Pair<String, Long>>())
+        val cursor = AtomicLong(0)
+        val checkBy = System.currentTimeMillis() + 15000
+        val pool = Executors.newFixedThreadPool(12)
+        try {
+            val futures = (0 until 12).map {
+                pool.submit(Runnable {
+                    while (true) {
+                        if (System.currentTimeMillis() > checkBy) return@Runnable
+                        val idx = cursor.getAndIncrement()
+                        if (idx >= raw.size) return@Runnable
+                        val u = raw[idx.toInt()]
+                        val size = probeFile(u)
+                        if (size > 0) found.add(u to size)
+                    }
+                })
+            }
             for (f in futures) {
                 try {
-                    f.get(limitMs + 3000, TimeUnit.MILLISECONDS)
+                    f.get(18000, TimeUnit.MILLISECONDS)
                 } catch (_: Exception) {
                 }
             }
@@ -251,10 +297,187 @@ object Traffic {
             pool.shutdownNow()
         }
 
-        val sec = (System.currentTimeMillis() - started) / 1000.0
+        var list = found.filter { it.second >= MIN_FILE_BYTES }.sortedByDescending { it.second }
+        if (list.size < 4) list = found.sortedByDescending { it.second }.take(8)
+        if (list.isEmpty()) return cached
+
+        val urls = list.map { it.first }
+        healthyUrls = urls
+        healthyAt = System.currentTimeMillis()
+        synchronized(publicLock) {
+            fileQueue.clear()
+            val head = urls.take(24).shuffled()
+            fileQueue.addAll(head)
+        }
+        return urls
+    }
+
+    /** Range 取 2 字节，返回文件总大小；失败返回 0 */
+    private fun probeFile(u: String): Long {
+        var conn: HttpURLConnection? = null
+        return try {
+            val c = (URL(u).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 5000
+                readTimeout = 5000
+                useCaches = false
+                setRequestProperty("User-Agent", UA)
+                setRequestProperty("Range", "bytes=0-1")
+            }
+            conn = c
+            val code = c.responseCode
+            if (code !in 200..299) return 0L
+            val cr = c.getHeaderField("Content-Range") ?: ""
+            val total = Regex("/(\\d+)\\s*$").find(cr)?.groupValues?.get(1)?.toLongOrNull()
+            total ?: (c.getHeaderField("Content-Length")?.toLongOrNull() ?: 0L)
+        } catch (_: Exception) {
+            0L
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun takeFromQueue(n: Int): List<String> {
+        val out = ArrayList<String>()
+        synchronized(publicLock) {
+            var guard = 0
+            while (out.size < n && guard++ < 400) {
+                if (fileQueue.isEmpty()) {
+                    val all = healthyUrls
+                    if (all.isEmpty()) break
+                    fileQueue.addAll(all.take(24).shuffled())
+                }
+                val u = fileQueue.removeFirst()
+                if (isBad(u) || out.contains(u)) continue
+                out.add(u)
+            }
+        }
+        return out
+    }
+
+    /** 同一个 pin（域名）前后两次测速用同一批文件 */
+    private fun pickFiles(pin: String, n: Int): List<String> {
+        if (pin.isNotEmpty()) {
+            val cur = synchronized(publicLock) { pinned[pin] }
+            if (cur != null) {
+                val good = cur.filter { !isBad(it) }
+                if (good.size == cur.size) return cur
+                val filled = good + takeFromQueue(n - good.size)
+                synchronized(publicLock) { pinned[pin] = filled }
+                return filled
+            }
+        }
+        val out = takeFromQueue(n)
+        if (pin.isNotEmpty()) {
+            synchronized(publicLock) {
+                if (pinned.size > 32) pinned.clear()
+                pinned[pin] = out
+            }
+        }
+        return out
+    }
+
+    /**
+     * 按时间测下行速率（默认 30 秒），单位 Mbps。
+     * 4 并发，丢掉前 1 秒热身，返回总速度 + 三段速度。
+     */
+    fun speedTest(src: String = speedSource, seconds: Int = 30, pin: String = ""): SpeedSample {
+        val totalMs = seconds * 1000L
+        val list: List<String> = if (src == "public") {
+            val all = try { publicSources() } catch (_: Exception) { emptyList() }
+            val picked = if (all.isNotEmpty()) pickFiles(pin, 4) else emptyList()
+            when {
+                picked.isNotEmpty() -> picked
+                all.isNotEmpty() -> all.take(4)
+                else -> listOf(SPEED_SOURCES.getValue("tencent"))
+            }
+        } else {
+            listOf(SPEED_SOURCES[src] ?: SPEED_SOURCES.getValue("gdxs"))
+        }
+
+        val t0 = System.currentTimeMillis()
+        val deadline = t0 + totalMs
+        val segMs = totalMs / 3
+        val buckets = AtomicLongArray(3)
+        val total = AtomicLong(0)
+        val stop = AtomicBoolean(false)
+        val pool = Executors.newFixedThreadPool(4)
+
+        try {
+            val futures = (0 until 4).map { idx ->
+                pool.submit(Runnable {
+                    var i = idx
+                    while (!stop.get() && System.currentTimeMillis() < deadline) {
+                        val u = list[i % list.size]
+                        i += 1
+                        if (deadline - System.currentTimeMillis() < 800) break
+
+                        var got = 0L
+                        var conn: HttpURLConnection? = null
+                        try {
+                            val c = (URL(u).openConnection() as HttpURLConnection).apply {
+                                connectTimeout = 5000
+                                readTimeout = 4000 // 停摆 4 秒就换文件
+                                useCaches = false
+                                setRequestProperty("User-Agent", UA)
+                                setRequestProperty("Cache-Control", "no-cache")
+                            }
+                            conn = c
+                            val code = c.responseCode
+                            if (code !in 200..299) {
+                                markBad(u)
+                                continue
+                            }
+                            val buf = ByteArray(32 * 1024)
+                            val stream = c.inputStream
+                            try {
+                                while (true) {
+                                    val n = stream.read(buf)
+                                    if (n <= 0) break
+                                    got += n.toLong()
+                                    val t = System.currentTimeMillis() - t0
+                                    if (t < 1000) continue // 热身
+                                    if (t >= totalMs) {
+                                        stop.set(true)
+                                        break
+                                    }
+                                    val b = minOf(2, (t / segMs).toInt())
+                                    buckets.addAndGet(b, n.toLong())
+                                    total.addAndGet(n.toLong())
+                                }
+                            } finally {
+                                try {
+                                    stream.close()
+                                } catch (_: Exception) {
+                                }
+                            }
+                            if (got == 0L) markBad(u)
+                        } catch (_: Exception) {
+                            if (got == 0L) markBad(u)
+                        } finally {
+                            conn?.disconnect()
+                        }
+                    }
+                })
+            }
+            for (f in futures) {
+                try {
+                    f.get(totalMs + 9000, TimeUnit.MILLISECONDS)
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+
         val bytes = total.get()
-        if (sec < 0.2 || bytes < 100_000L) return 0.0
-        return bytes * 8.0 / sec / 1_000_000.0
+        val span = doubleArrayOf(
+            maxOf(1000L, segMs - 1000).toDouble(),
+            segMs.toDouble(),
+            segMs.toDouble()
+        )
+        val seg = (0..2).map { i -> Math.round(buckets.get(i) * 8.0 / span[i] / 1000.0 * 10.0) / 10.0 }
+        val mbps = if (bytes > 0) bytes * 8.0 / ((totalMs - 1000) / 1000.0) / 1_000_000.0 else 0.0
+        return SpeedSample(Math.round(mbps * 10.0) / 10.0, seg, bytes)
     }
 
     fun fetch(url: String): Result {
