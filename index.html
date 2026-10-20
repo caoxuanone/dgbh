@@ -139,9 +139,9 @@
     <section class="card">
       <h2>参数</h2>
       <div class="row">
-        <label class="field"><span>间隔（秒）</span><input id="interval" type="number" min="3" max="3600" step="1" value="30"></label>
+        <label class="field"><span>间隔（秒）</span><input id="interval" type="number" min="3" max="3600" step="1" value="60"></label>
         <label class="field"><span>随机抖动（秒，±）</span><input id="jitter" type="number" min="0" max="600" step="1" value="0"></label>
-        <label class="field"><span>每轮请求数（省电＝少而多）</span><input id="burst" type="number" min="1" max="6" step="1" value="2"></label>
+        <label class="field"><span>每轮请求数（省电＝少而多）</span><input id="burst" type="number" min="1" max="6" step="1" value="1"></label>
       </div>
 
       <label class="switch"><input type="checkbox" id="preview" checked> 开独立访问窗口（真实加载整页，流量主要来源）</label>
@@ -190,7 +190,7 @@
 (() => {
   "use strict";
 
-  const CFG_KEY = "gdxs.cfg.v2";
+  const CFG_KEY = "gdxs.cfg.v3";
   // 全部实测可访问：页面在独立窗口整页加载，静态资源用来补足流量
   const DEFAULT_TARGETS = [
     "https://www.10099.com.cn/",
@@ -244,7 +244,7 @@
   };
 
   function loadCfg() {
-    let cfg = { interval: 30, jitter: 0, burst: 2, preview: true, targets: DEFAULT_TARGETS.slice() };
+    let cfg = { interval: 60, jitter: 0, burst: 1, preview: true, targets: DEFAULT_TARGETS.slice() };
     try {
       const raw = localStorage.getItem(CFG_KEY);
       if (raw) Object.assign(cfg, JSON.parse(raw));
@@ -259,7 +259,7 @@
   function saveCfg() {
     cfg.interval = clamp(num(el.interval.value, 30), 3, 3600);
     cfg.jitter = clamp(num(el.jitter.value, 0), 0, 600);
-    cfg.burst = clamp(num(el.burst.value, 2), 1, 6);
+    cfg.burst = clamp(num(el.burst.value, 1), 1, 6);
     cfg.preview = el.preview.checked;
     cfg.targets = parseTargets(el.targets.value);
     state.bag = [];
@@ -407,8 +407,8 @@
       note.innerHTML =
         "<b>后台模式：</b>访问循环跑在 App 的前台服务里，用原生 HTTP 直接请求，切到别的 App 也能继续；" +
         "锁屏自动暂停，亮屏自动继续。状态栏通知里的「停止」可以随时叫停。" +
-        "<br><b>省电：</b>把间隔调到 60 秒、每轮请求数保持 2 —— 流量和原来一样，但射频唤醒次数减半。" +
-        "间隔越长越省电，因为每次唤醒都要叫醒手机无线电并空转几秒。";
+        "<br><b>省电：</b>默认 60 秒一次、每次 1 个请求。间隔越长越省电——每次唤醒都要叫醒手机无线电再空转几秒。" +
+        "想让同样的时间产生更多流量，把「每轮请求数」加到 2~3，比缩短间隔省电。";
     }
     const bar = document.querySelector(".btns");
     if (bar && !document.getElementById("btnBg")) {
@@ -684,7 +684,7 @@
   });
 
   el.btnReset.addEventListener("click", () => {
-    cfg = { interval: 30, jitter: 0, preview: true, targets: DEFAULT_TARGETS.slice() };
+    cfg = { interval: 60, jitter: 0, burst: 1, preview: true, targets: DEFAULT_TARGETS.slice() };
     try { localStorage.removeItem(CFG_KEY); } catch (_) {}
     fillForm();
     if (NATIVE) { nativeApply(); return; }

@@ -309,9 +309,9 @@ class TrafficService : Service() {
 
     private fun restore() {
         val sp = getSharedPreferences(PREFS, MODE_PRIVATE)
-        Traffic.interval = sp.getInt("interval", 30).coerceIn(3, 3600)
+        Traffic.interval = sp.getInt("interval", 60).coerceIn(3, 3600)
         Traffic.jitter = sp.getInt("jitter", 0).coerceIn(0, 600)
-        Traffic.burst = sp.getInt("burst", 2).coerceIn(1, 6)
+        Traffic.burst = sp.getInt("burst", 1).coerceIn(1, 6)
         Traffic.targets = Traffic.parseTargets(sp.getString("targets", null))
         Traffic.running = sp.getBoolean("running", false)
         if (Traffic.running && Traffic.startedAt == 0L) Traffic.resetStats()

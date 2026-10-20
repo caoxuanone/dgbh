@@ -45,9 +45,9 @@ object Traffic {
     @Volatile var fail = 0
     @Volatile var bytes = 0L
     @Volatile var startedAt = 0L
-    @Volatile var interval = 30
+    @Volatile var interval = 60
     @Volatile var jitter = 0
-    @Volatile var burst = 2
+    @Volatile var burst = 1
     @Volatile var targets: List<String> = DEFAULT_TARGETS
 
     private val log = ArrayDeque<String>()
