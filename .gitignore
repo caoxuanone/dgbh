@@ -10,6 +10,8 @@ android/.idea/
 *.aab
 *.keystore
 *.jks
+# 例外：这是本项目的固定签名（个人自用），必须提交，否则每次构建签名都会变
+!android/app/gdxs.jks
 
 # 系统
 .DS_Store

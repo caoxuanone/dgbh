@@ -3,6 +3,24 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// 版本号自动递增：CI 用 run number，本地用 git 提交数，避免每次装的都是「1.0」
+fun buildNumber(): Int {
+    System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()?.let { return it }
+    return try {
+        val p = ProcessBuilder("git", "rev-list", "--count", "HEAD")
+            .directory(rootProject.projectDir.parentFile)
+            .redirectErrorStream(true)
+            .start()
+        val n = p.inputStream.bufferedReader().use { it.readText() }.trim().toIntOrNull() ?: 1
+        p.waitFor()
+        n
+    } catch (_: Exception) {
+        1
+    }
+}
+
+val appBuildNumber = buildNumber()
+
 android {
     namespace = "com.gdxs.keepalive"
     compileSdk = 35
@@ -11,12 +29,26 @@ android {
         applicationId = "com.gdxs.keepalive"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appBuildNumber
+        versionName = "1.0.$appBuildNumber"
+    }
+
+    signingConfigs {
+        // 固定签名：随仓库提交，保证每次构建的 APK 签名一致，能直接覆盖安装
+        create("stable") {
+            storeFile = file("gdxs.jks")
+            storePassword = "gdxs123456"
+            keyAlias = "gdxs"
+            keyPassword = "gdxs123456"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("stable")
+        }
         release {
+            signingConfig = signingConfigs.getByName("stable")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
