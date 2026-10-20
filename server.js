@@ -20,6 +20,9 @@ const UA =
   "Mozilla/5.0 (Linux; Android 14; PGT-AN10) AppleWebKit/537.36 (KHTML, like Gecko) " +
   "Chrome/124.0.0.0 Mobile Safari/537.36";
 
+// 测速用的固定文件：站点自己的 565KB 静态资源，不受 WAF 影响
+const SPEED_URL = process.env.SPEED_URL || "https://www.10099.com.cn/js/common-85ed7.js";
+
 function allowed(urlStr) {
   let u;
   try {
@@ -118,6 +121,50 @@ const server = http.createServer(async (req, res) => {
         error: String(e && e.message ? e.message : e),
       });
     }
+  }
+
+  // 测下行速度：连续拉静态资源，最多 3MB 或 8 秒，换算成 Mbps
+  if (url.pathname === "/api/speed") {
+    const u = allowed(SPEED_URL);
+    if (!u) return sendJson(res, 400, { ok: false, error: "url not allowed" });
+
+    const t0 = Date.now();
+    const limitMs = 8000;
+    const targetBytes = 3_000_000;
+    let bytes = 0;
+
+    for (let i = 0; i < 8 && bytes < targetBytes && Date.now() - t0 < limitMs; i++) {
+      try {
+        const r = await fetch(u, {
+          headers: {
+            "user-agent": UA,
+            "cache-control": "no-cache",
+            pragma: "no-cache",
+            referer: u.origin + "/",
+          },
+          redirect: "follow",
+          signal: AbortSignal.timeout(limitMs),
+        });
+        if (!r.body) break;
+        for await (const chunk of r.body) {
+          bytes += chunk.length;
+          if (bytes >= targetBytes) break;
+          if (Date.now() - t0 >= limitMs) break;
+        }
+      } catch {
+        // 超时或中断：用已经收到的字节数算
+        break;
+      }
+    }
+
+    const ms = Date.now() - t0;
+    const mbps = ms > 200 && bytes > 100_000 ? (bytes * 8) / ms / 1000 : 0;
+    return sendJson(res, 200, {
+      ok: true,
+      bytes,
+      ms,
+      mbps: Math.round(mbps * 10) / 10,
+    });
   }
 
   if (req.method === "GET" || req.method === "HEAD") {
