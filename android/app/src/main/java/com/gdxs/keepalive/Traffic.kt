@@ -154,7 +154,7 @@ object Traffic {
         return o.toString()
     }
 
-    // ---------- 逐域名测试 ----------
+    // ---------- 域名对比测试 ----------
 
     fun probeReset(total: Int) {
         synchronized(probeLock) { probeResults.clear() }
@@ -162,6 +162,7 @@ object Traffic {
         probeIndex = 0
         probeTotal = total
         probeCurrent = ""
+        probePhase = ""
         probeDoneAt = 0L
     }
 
@@ -327,7 +328,7 @@ object Traffic {
             val code = c.responseCode
             if (code !in 200..299) return 0L
             val cr = c.getHeaderField("Content-Range") ?: ""
-            val total = Regex("/(\\d+)\\s*$").find(cr)?.groupValues?.get(1)?.toLongOrNull()
+            val total = Regex("/(\\d+)\\s*\$").find(cr)?.groupValues?.get(1)?.toLongOrNull()
             total ?: (c.getHeaderField("Content-Length")?.toLongOrNull() ?: 0L)
         } catch (_: Exception) {
             0L

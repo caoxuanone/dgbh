@@ -502,7 +502,7 @@
     probe.results = [];
     probe.index = 0;
     probe.total = list.length;
-    probe.current = "";
+    probe.current = src === "public" ? "准备测速源（首次约 15 秒）…" : "";
     probe.doneAt = 0;
     renderProbe(probe);
 

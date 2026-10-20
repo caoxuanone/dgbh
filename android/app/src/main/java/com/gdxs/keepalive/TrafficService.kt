@@ -225,7 +225,7 @@ class TrafficService : Service() {
         return list.random()
     }
 
-    // ---------- 逐域名测试 ----------
+    // ---------- 域名对比测试 ----------
 
     /** 分段睡眠，期间可被「停止测试」打断 */
     private fun sleepWhileProbing(ms: Int) {
@@ -244,6 +244,16 @@ class TrafficService : Service() {
 
         probeWorker.execute {
             try {
+                // 先把公共测速源体检一遍，免得第一次「基线测速 30 秒」里偷偷多花 20 秒
+                if (Traffic.speedSource == "public") {
+                    Traffic.probePhase = "准备测速源…"
+                    updateNotification()
+                    try {
+                        Traffic.publicSources()
+                    } catch (_: Exception) {
+                    }
+                }
+
                 for (i in targets.indices) {
                     if (!Traffic.probing) break
                     val url = targets[i]
