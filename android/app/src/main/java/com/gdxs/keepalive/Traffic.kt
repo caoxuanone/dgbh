@@ -58,6 +58,7 @@ object Traffic {
     @Volatile var probeDoneAt = 0L
     @Volatile var keepMbps = 5.0
     @Volatile var dropMbps = 0.5
+    @Volatile var probeGap = 90
     @Volatile var targetsVersion = 0
 
     private val probeResults = ArrayDeque<String>()

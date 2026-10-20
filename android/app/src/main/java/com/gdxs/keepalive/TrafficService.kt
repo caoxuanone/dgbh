@@ -127,6 +127,7 @@ class TrafficService : Service() {
             ACTION_PROBE -> {
                 Traffic.keepMbps = intent.getDoubleExtra("keep", 5.0)
                 Traffic.dropMbps = intent.getDoubleExtra("drop", 0.5)
+                Traffic.probeGap = intent.getIntExtra("gap", 90).coerceIn(0, 600)
                 val list = Traffic.parseTargets(intent.getStringExtra("targets"))
                 startForegroundCompat()
                 pending?.cancel(false)
@@ -225,8 +226,16 @@ class TrafficService : Service() {
 
     // ---------- 逐域名测试 ----------
 
-    private fun startProbe(list: List<String>) {
-        if (Traffic.probing) return
+    /** 分段睡眠，期间可被「停止测试」打断 */
+    private fun sleepWhileProbing(ms: Int) {
+        var waited = 0
+        while (waited < ms && Traffic.probing) {
+            Thread.sleep(500)
+            waited += 500
+        }
+    }
+
+    private fun startProbe(list: List<String>) {        if (Traffic.probing) return
         val targets = if (list.isEmpty()) Traffic.DEFAULT_TARGETS else list
         Traffic.probeReset(targets.size)
         updateNotification()
@@ -245,25 +254,27 @@ class TrafficService : Service() {
 
                     if (r.status !in 200..399) {
                         Traffic.probeAdd(url, r.status, 0.0, "fail")
-                        continue
+                    } else {
+                        // 访问成功后等 10 秒再测速
+                        sleepWhileProbing(10_000)
+                        if (!Traffic.probing) break
+
+                        val mbps = Traffic.speedTest()
+                        val verdict = when {
+                            mbps >= Traffic.keepMbps -> "keep"
+                            mbps <= Traffic.dropMbps -> "drop"
+                            else -> "maybe"
+                        }
+                        Traffic.probeAdd(url, r.status, mbps, verdict)
+                        updateNotification()
                     }
 
-                    // 访问成功后等 10 秒再测速
-                    var waited = 0
-                    while (waited < 10_000 && Traffic.probing) {
-                        Thread.sleep(500)
-                        waited += 500
+                    // 测速完成后等一会儿，再测下一个（让网络状态回落到基线）
+                    if (i < targets.lastIndex) {
+                        Traffic.probeCurrent = "等待 ${Traffic.probeGap} 秒…"
+                        updateNotification()
+                        sleepWhileProbing(Traffic.probeGap * 1000)
                     }
-                    if (!Traffic.probing) break
-
-                    val mbps = Traffic.speedTest()
-                    val verdict = when {
-                        mbps >= Traffic.keepMbps -> "keep"
-                        mbps <= Traffic.dropMbps -> "drop"
-                        else -> "maybe"
-                    }
-                    Traffic.probeAdd(url, r.status, mbps, verdict)
-                    updateNotification()
                 }
             } catch (_: InterruptedException) {
             } finally {
