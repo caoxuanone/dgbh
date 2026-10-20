@@ -7,6 +7,9 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 全局运行状态 + HTTP 请求实现。
@@ -59,10 +62,18 @@ object Traffic {
     @Volatile var keepMbps = 5.0
     @Volatile var dropMbps = 0.5
     @Volatile var probeGap = 90
+    @Volatile var speedSource = "gdxs"
     @Volatile var targetsVersion = 0
 
     private val probeResults = ArrayDeque<String>()
     private val probeLock = Any()
+
+    /** 测速源。公共镜像大多对单 IP 限速，只作对照。 */
+    val SPEED_SOURCES = mapOf(
+        "gdxs" to "https://www.10099.com.cn/js/common-85ed7.js",
+        "tencent" to "https://mirrors.cloud.tencent.com/ubuntu/ls-lR.gz",
+        "huawei" to "https://mirrors.huaweicloud.com/ubuntu/ls-lR.gz"
+    )
 
     private val log = ArrayDeque<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.CHINA)
@@ -173,47 +184,75 @@ object Traffic {
     }
 
     /**
-     * 下载约 3MB，测下行速率，单位 Mbps；失败返回 0。
-     * 用站点自己的 565KB 静态资源重复拉取，避免依赖第三方测速站。
+     * 测下行速率，单位 Mbps；失败返回 0。
+     * 4 个并发连接拉同一个源，最多 4MB 或 6 秒——单连接受 TCP 慢启动影响，波动很大。
      */
-    fun speedTest(): Double {
-        val url = "https://www.10099.com.cn/js/common-85ed7.js"
+    fun speedTest(src: String = speedSource): Double {
+        val url = SPEED_SOURCES[src] ?: SPEED_SOURCES.getValue("gdxs")
         val started = System.currentTimeMillis()
-        val limitMs = 8000L
-        val targetBytes = 3_000_000L
-        var bytes = 0L
-        var round = 0
+        val limitMs = 6000L
+        val cap = 4_000_000L
+        val total = AtomicLong(0)
+        val pool = Executors.newFixedThreadPool(4)
 
-        while (round < 8 && bytes < targetBytes && System.currentTimeMillis() - started < limitMs) {
-            round++
-            var conn: HttpURLConnection? = null
-            try {
-                conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 8000
-                    readTimeout = 8000
-                    useCaches = false
-                    setRequestProperty("Cache-Control", "no-cache")
-                    setRequestProperty("User-Agent", UA)
-                }
-                val buf = ByteArray(32 * 1024)
-                conn.inputStream.use { stream ->
-                    while (true) {
-                        val n = stream.read(buf)
-                        if (n <= 0) break
-                        bytes += n
-                        if (bytes >= targetBytes) break
-                        if (System.currentTimeMillis() - started >= limitMs) break
+        try {
+            val futures = (0 until 4).map { idx ->
+                pool.submit {
+                    var pos = idx * 1_048_576L
+                    while (total.get() < cap && System.currentTimeMillis() - started < limitMs) {
+                        var conn: HttpURLConnection? = null
+                        try {
+                            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                                connectTimeout = 6000
+                                readTimeout = 6000
+                                useCaches = false
+                                setRequestProperty("Cache-Control", "no-cache")
+                                setRequestProperty("User-Agent", UA)
+                                setRequestProperty("Range", "bytes=$pos-${pos + 1_048_575L}")
+                            }
+                            val code = conn.responseCode
+                            // 文件比 Range 短（比如 565KB 的 js）：从头重下
+                            if (code == 416) {
+                                pos = 0L
+                                continue
+                            }
+                            if (code < 200 || code >= 300) break
+
+                            var read = 0L
+                            val buf = ByteArray(32 * 1024)
+                            conn.inputStream.use { stream ->
+                                while (true) {
+                                    val n = stream.read(buf)
+                                    if (n <= 0) break
+                                    read += n
+                                    total.addAndGet(n.toLong())
+                                    if (total.get() >= cap) break
+                                    if (System.currentTimeMillis() - started >= limitMs) break
+                                }
+                            }
+                            // 206 支持分段，往后接着拉；200 是整文件，下一轮从头
+                            pos = if (code == 206) pos + read else 0L
+                            if (read == 0L) break
+                        } catch (_: Exception) {
+                            break
+                        } finally {
+                            conn?.disconnect()
+                        }
                     }
                 }
-            } catch (_: Exception) {
-                // 这一轮失败就结束，用已经拿到的字节数算
-                break
-            } finally {
-                conn?.disconnect()
             }
+            for (f in futures) {
+                try {
+                    f.get(limitMs + 3000, TimeUnit.MILLISECONDS)
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            pool.shutdownNow()
         }
 
         val sec = (System.currentTimeMillis() - started) / 1000.0
+        val bytes = total.get()
         if (sec < 0.2 || bytes < 100_000L) return 0.0
         return bytes * 8.0 / sec / 1_000_000.0
     }

@@ -128,6 +128,7 @@ class TrafficService : Service() {
                 Traffic.keepMbps = intent.getDoubleExtra("keep", 5.0)
                 Traffic.dropMbps = intent.getDoubleExtra("drop", 0.5)
                 Traffic.probeGap = intent.getIntExtra("gap", 90).coerceIn(0, 600)
+                Traffic.speedSource = intent.getStringExtra("src") ?: "gdxs"
                 val list = Traffic.parseTargets(intent.getStringExtra("targets"))
                 startForegroundCompat()
                 pending?.cancel(false)

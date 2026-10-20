@@ -20,8 +20,12 @@ const UA =
   "Mozilla/5.0 (Linux; Android 14; PGT-AN10) AppleWebKit/537.36 (KHTML, like Gecko) " +
   "Chrome/124.0.0.0 Mobile Safari/537.36";
 
-// 测速用的固定文件：站点自己的 565KB 静态资源，不受 WAF 影响
-const SPEED_URL = process.env.SPEED_URL || "https://www.10099.com.cn/js/common-85ed7.js";
+// 测速源。公共镜像多数对单 IP 限速，数值可能偏低，只作对照用。
+const SPEED_SOURCES = {
+  gdxs: "https://www.10099.com.cn/js/common-85ed7.js",
+  tencent: "https://mirrors.cloud.tencent.com/ubuntu/ls-lR.gz",
+  huawei: "https://mirrors.huaweicloud.com/ubuntu/ls-lR.gz",
+};
 
 function allowed(urlStr) {
   let u;
@@ -123,44 +127,59 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 测下行速度：连续拉静态资源，最多 3MB 或 8 秒，换算成 Mbps
+  // 测下行速度：4 并发拉大文件，最多 4MB 或 6 秒，换算成 Mbps
   if (url.pathname === "/api/speed") {
-    const u = allowed(SPEED_URL);
-    if (!u) return sendJson(res, 400, { ok: false, error: "url not allowed" });
+    const key = url.searchParams.get("src") || "gdxs";
+    const src = SPEED_SOURCES[key];
+    if (!src) return sendJson(res, 400, { ok: false, error: "unknown src" });
 
+    // 公共源不在 10099 白名单里，但只允许上面写死的几个地址
+    const u = new URL(src);
     const t0 = Date.now();
-    const limitMs = 8000;
-    const targetBytes = 3_000_000;
+    const limitMs = 6000;
+    const cap = 4_000_000;
     let bytes = 0;
+    let stop = false;
 
-    for (let i = 0; i < 8 && bytes < targetBytes && Date.now() - t0 < limitMs; i++) {
-      try {
-        const r = await fetch(u, {
-          headers: {
-            "user-agent": UA,
-            "cache-control": "no-cache",
-            pragma: "no-cache",
-            referer: u.origin + "/",
-          },
-          redirect: "follow",
-          signal: AbortSignal.timeout(limitMs),
-        });
-        if (!r.body) break;
-        for await (const chunk of r.body) {
-          bytes += chunk.length;
-          if (bytes >= targetBytes) break;
-          if (Date.now() - t0 >= limitMs) break;
+    const stream = async (idx) => {
+      let pos = idx * 1048576;
+      while (!stop && bytes < cap && Date.now() - t0 < limitMs) {
+        try {
+          const r = await fetch(u, {
+            headers: {
+              "user-agent": UA,
+              "cache-control": "no-cache",
+              range: `bytes=${pos}-${pos + 1048575}`,
+              referer: u.origin + "/",
+            },
+            redirect: "follow",
+            signal: AbortSignal.timeout(limitMs),
+          });
+          // 文件比 Range 短（比如 565KB 的 js）：从头重下，别停
+          if (r.status === 416) { pos = 0; continue; }
+          if (!r.body) return;
+          let read = 0;
+          for await (const c of r.body) {
+            read += c.length;
+            bytes += c.length;
+            if (bytes >= cap || Date.now() - t0 >= limitMs) { stop = true; break; }
+          }
+          // 206 说明支持分段，接着往后拉；200 说明整文件，下一轮还是从头
+          pos = r.status === 206 ? pos + read : 0;
+          if (!read) return;
+        } catch {
+          return;
         }
-      } catch {
-        // 超时或中断：用已经收到的字节数算
-        break;
       }
-    }
+    };
+
+    await Promise.all(Array.from({ length: 4 }, (_, i) => stream(i)));
 
     const ms = Date.now() - t0;
     const mbps = ms > 200 && bytes > 100_000 ? (bytes * 8) / ms / 1000 : 0;
     return sendJson(res, 200, {
       ok: true,
+      src: key,
       bytes,
       ms,
       mbps: Math.round(mbps * 10) / 10,

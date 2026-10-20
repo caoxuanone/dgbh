@@ -70,7 +70,7 @@
 
   label.field{display:block;margin-bottom:12px}
   label.field > span{display:block;font-size:12px;color:var(--dim);margin-bottom:6px}
-  input[type=number],input[type=text],textarea{
+  input[type=number],input[type=text],select,textarea{
     width:100%;background:#0d1219;color:var(--text);border:1px solid var(--line);
     border-radius:10px;padding:9px 11px;font-family:var(--mono);font-size:13px;outline:none;
   }
@@ -174,6 +174,13 @@
         <button id="btnProbe">逐域名测试</button>
         <button id="btnProbeStop">停止测试</button>
       </div>
+      <label class="field" style="margin-top:12px"><span>测速源</span>
+        <select id="pSrc">
+          <option value="gdxs">10099 静态资源（默认，不限速）</option>
+          <option value="tencent">腾讯云镜像（公共，可能限速）</option>
+          <option value="huawei">华为云镜像（公共，可能限速）</option>
+        </select>
+      </label>
       <div class="note" id="probeStatus" style="margin-top:12px">
         每个域名：访问一次 → 等 10 秒 → 测下行速度 → 等 90 秒 → 下一个。低于「删除阈值」的域名，测完自动从目标清单里移除。
       </div>
@@ -423,16 +430,18 @@
     const keepEl = document.getElementById("pKeep");
     const dropEl = document.getElementById("pDrop");
     const gapEl = document.getElementById("pGap");
+    const srcEl = document.getElementById("pSrc");
 
     document.getElementById("btnProbe").addEventListener("click", () => {
       saveCfg();
       const keep = parseFloat(keepEl.value) || 5;
       const drop = parseFloat(dropEl.value) || 0.5;
       const gap = num(gapEl.value, 90);
+      const src = (srcEl && srcEl.value) || "gdxs";
       if (NATIVE) {
-        bridge("startProbe", JSON.stringify(cfg.targets), keep, drop, gap);
+        bridge("startProbe", JSON.stringify(cfg.targets), keep, drop, gap, src);
       } else {
-        startProbeDesktop(keep, drop, gap);
+        startProbeDesktop(keep, drop, gap, src);
       }
     });
 
@@ -449,7 +458,7 @@
     if (st) st.textContent = text;
   }
 
-  async function startProbeDesktop(keep, drop, gapSec) {
+  async function startProbeDesktop(keep, drop, gapSec, src) {
     if (probe.running) return;
     if (!state.proxy) {
       probeHint("桌面版测速需要本地代理：先双击 start.bat（或 node server.js），再从 http://127.0.0.1:8787 打开本页。");
@@ -515,7 +524,7 @@
         renderProbe(probe);
         let mbps = 0;
         try {
-          const r = await fetch(`${PROXY_ORIGIN}/api/speed`, { cache: "no-store" });
+          const r = await fetch(`${PROXY_ORIGIN}/api/speed?src=${encodeURIComponent(src || "gdxs")}`, { cache: "no-store" });
           const j = await r.json();
           mbps = j.mbps || 0;
         } catch (_) {}
