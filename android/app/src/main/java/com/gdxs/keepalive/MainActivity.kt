@@ -136,16 +136,21 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
-        fun startProbe(targetsJson: String, up: Double, down: Double, gap: Int, src: String) {
+        fun startProbe(targetsJson: String, limit: Double, fast: Double, maxAlive: Int, src: String) {
             val i = Intent(this@MainActivity, TrafficService::class.java).apply {
                 action = TrafficService.ACTION_PROBE
                 putExtra("targets", targetsJson)
-                putExtra("up", up)
-                putExtra("down", down)
-                putExtra("gap", gap)
+                putExtra("limit", limit)
+                putExtra("fast", fast)
+                putExtra("maxAlive", maxAlive)
                 putExtra("src", src)
             }
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        }
+
+        @JavascriptInterface
+        fun probeAck() {
+            Traffic.resetAck++
         }
 
         @JavascriptInterface

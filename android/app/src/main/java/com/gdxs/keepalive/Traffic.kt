@@ -23,18 +23,19 @@ object Traffic {
         "Mozilla/5.0 (Linux; Android 14; PGT-AN10) AppleWebKit/537.36 (KHTML, like Gecko) " +
             "Chrome/124.0.0.0 Mobile Safari/537.36"
 
+    // 命中测试按这个顺序跑：可疑的业务/网关入口在前，纯静态资源垫底
     val DEFAULT_TARGETS = listOf(
+        "https://cblink.10099.com.cn/",
+        "https://www.10099.com.cn/login.html",
+        "https://www.10099.com.cn/personal-center-deposit-order.html",
+        "https://www.10099.com.cn/transaction-manage-package-selection.html",
+        "https://partner.10099.com.cn/",
         "https://www.10099.com.cn/",
         "https://www.10099.com.cn/index.html",
-        "https://www.10099.com.cn/login.html",
+        "https://www.10099.com.cn/transaction-manage-number-selection.html",
         "https://www.10099.com.cn/help-center.html",
         "https://www.10099.com.cn/browser-version.html",
-        "https://www.10099.com.cn/transaction-manage-package-selection.html",
-        "https://www.10099.com.cn/transaction-manage-number-selection.html",
-        "https://www.10099.com.cn/personal-center-deposit-order.html",
         "https://www.10099.com.cn/help-center-video-ringtone.html",
-        "https://cblink.10099.com.cn/",
-        "https://partner.10099.com.cn/",
         "https://www.10099.com.cn/js/common-85ed7.js",
         "https://www.10099.com.cn/js/vendor-21074.js",
         "https://www.10099.com.cn/js/polyfill-45864.js",
@@ -55,16 +56,19 @@ object Traffic {
     @Volatile var burst = 1
     @Volatile var targets: List<String> = DEFAULT_TARGETS
 
-    // ---- 域名对比测试 ----
+    // ---- 命中测试 ----
     @Volatile var probing = false
     @Volatile var probeIndex = 0
     @Volatile var probeTotal = 0
     @Volatile var probeCurrent = ""
     @Volatile var probePhase = ""
     @Volatile var probeDoneAt = 0L
-    @Volatile var upRatio = 1.5
-    @Volatile var downRatio = 0.67
-    @Volatile var probeGap = 90
+    @Volatile var limitMBs = 1.0      // 触发线
+    @Volatile var fastMBs = 2.0       // 加速线（基线高于它就先等一等）
+    @Volatile var maxAlive = 180      // 回落监控上限（秒）
+    @Volatile var needResetAck = false // 需要用户手动恢复网络
+    @Volatile var resetAck = 0
+    @Volatile var probeHit = ""
     @Volatile var speedSource = "public"
     @Volatile var targetsVersion = 0
 
@@ -163,38 +167,27 @@ object Traffic {
         probeTotal = total
         probeCurrent = ""
         probePhase = ""
+        probeHit = ""
+        needResetAck = false
         probeDoneAt = 0L
     }
 
     fun probeAdd(
         url: String,
         status: Int,
-        base: Double,
-        after: Double,
-        ratio: Double,
-        seg: List<Double>,
+        baseMBs: Double,
+        afterMBs: Double,
+        alive: Int,
         verdict: String
     ) {
         val o = JSONObject()
             .put("url", url)
             .put("status", status)
-            .put("base", Math.round(base * 10.0) / 10.0)
-            .put("after", Math.round(after * 10.0) / 10.0)
-            .put("ratio", Math.round(ratio * 100.0) / 100.0)
-            .put("seg", JSONArray(seg.map { Math.round(it * 10.0) / 10.0 }))
+            .put("base", Math.round(baseMBs * 100.0) / 100.0)
+            .put("after", Math.round(afterMBs * 100.0) / 100.0)
+            .put("alive", alive)
             .put("verdict", verdict)
         synchronized(probeLock) { probeResults.addLast(o.toString()) }
-    }
-
-    fun probeVerdicts(): List<Pair<String, String>> {
-        val out = ArrayList<Pair<String, String>>()
-        synchronized(probeLock) {
-            for (line in probeResults) {
-                val o = JSONObject(line)
-                out.add(o.optString("url") to o.optString("verdict"))
-            }
-        }
-        return out
     }
 
     fun probeJson(): JSONObject {
@@ -204,8 +197,11 @@ object Traffic {
             .put("total", probeTotal)
             .put("current", probePhase.ifEmpty { probeCurrent })
             .put("doneAt", probeDoneAt)
-            .put("up", upRatio)
-            .put("down", downRatio)
+            .put("limit", limitMBs)
+            .put("fast", fastMBs)
+            .put("maxAlive", maxAlive)
+            .put("hit", probeHit)
+            .put("needAck", needResetAck)
         val arr = JSONArray()
         synchronized(probeLock) { for (line in probeResults) arr.put(JSONObject(line)) }
         p.put("results", arr)
@@ -378,10 +374,10 @@ object Traffic {
     }
 
     /**
-     * 按时间测下行速率（默认 30 秒），单位 Mbps。
+     * 按时间测下行速率（默认 10 秒），单位 Mbps。
      * 4 并发，丢掉前 1 秒热身，返回总速度 + 三段速度。
      */
-    fun speedTest(src: String = speedSource, seconds: Int = 30, pin: String = ""): SpeedSample {
+    fun speedTest(src: String = speedSource, seconds: Int = 10, pin: String = ""): SpeedSample {
         val totalMs = seconds * 1000L
         val list: List<String> = if (src == "public") {
             val all = try { publicSources() } catch (_: Exception) { emptyList() }
