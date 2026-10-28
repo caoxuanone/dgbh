@@ -11,11 +11,13 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.widget.FrameLayout
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 
@@ -31,12 +33,38 @@ class MainActivity : Activity() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
+    @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         webView = WebView(this)
         webView.setBackgroundColor(Color.parseColor("#0b0e14"))
-        setContentView(webView)
+
+        // 安卓 15 起 targetSdk 35 强制全面屏：WebView 会画到状态栏底下，
+        // 所以套一层容器，按系统栏高度加内边距，页面就不用自己躲状态栏了
+        val root = FrameLayout(this)
+        root.setBackgroundColor(Color.parseColor("#0b0e14"))
+        root.addView(
+            webView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            // 安卓 15 还会让键盘盖住页面，这里把 IME 的高度也算进去
+            val imeBottom = if (Build.VERSION.SDK_INT >= 30) {
+                insets.getInsets(android.view.WindowInsets.Type.ime()).bottom
+            } else 0
+            v.setPadding(
+                insets.systemWindowInsetLeft,
+                insets.systemWindowInsetTop,
+                insets.systemWindowInsetRight,
+                maxOf(insets.systemWindowInsetBottom, imeBottom)
+            )
+            insets
+        }
+        setContentView(root)
 
         with(webView.settings) {
             javaScriptEnabled = true

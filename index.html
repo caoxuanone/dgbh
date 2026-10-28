@@ -76,8 +76,8 @@
   }
   input:focus,textarea:focus{border-color:#2f4a6b;box-shadow:0 0 0 3px rgba(74,168,255,.12)}
   textarea{min-height:132px;resize:vertical;line-height:1.7}
-  .row{display:flex;gap:10px}
-  .row > *{flex:1}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row > *{flex:1;min-width:130px}
 
   .btns{display:flex;gap:9px;flex-wrap:wrap;margin-top:4px}
   button{
@@ -184,6 +184,9 @@
           <option value="huawei">华为云镜像</option>
         </select>
       </label>
+      <div class="note" style="margin-top:0;padding:8px 11px">
+        固定参数：每次测速 <b>10 秒</b> · 访问后等 <b>3 秒</b> · 监控间隔 <b>5 秒</b> · 单次监控上限 <b>30 分钟</b> · 命中后保活 <b>50 秒 ±3</b>
+      </div>
       <div class="note" id="probeStatus" style="margin-top:12px">
         开测先确认已限速（&lt; 限速线）；没限速就每 15 秒测一次等它回落，最多 10 分钟。之后逐个访问链接：测 10 秒，≤ 加速线判「无效」；&gt; 加速线就持续监控到掉回限速线以下，记录存活时长。全部跑完才结束。
       </div>
