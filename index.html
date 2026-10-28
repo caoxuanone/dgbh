@@ -167,9 +167,9 @@
     <section class="card" id="probeCard" style="display:none">
       <h2>命中测试（找出触发提速的域名）</h2>
       <div class="row">
-        <label class="field"><span>触发线（MB/s）</span><input id="pLimit" type="number" min="0.1" max="50" step="0.1" value="1"></label>
-        <label class="field"><span>加速线（MB/s）</span><input id="pFast" type="number" min="0.2" max="100" step="0.1" value="2"></label>
-        <label class="field"><span>回落上限（秒）</span><input id="pMax" type="number" min="20" max="600" step="10" value="180"></label>
+        <label class="field"><span>限速线（KB/s）</span><input id="pLimit" type="number" min="50" max="100000" step="50" value="650"></label>
+        <label class="field"><span>加速线（MB/s）</span><input id="pFast" type="number" min="0.1" max="100" step="0.1" value="2"></label>
+        <label class="field"><span>开测等待（分钟）</span><input id="pWait" type="number" min="1" max="60" step="1" value="10"></label>
       </div>
       <div class="btns">
         <button id="btnProbe">开始命中测试</button>
@@ -185,16 +185,12 @@
         </select>
       </label>
       <div class="note" id="probeStatus" style="margin-top:12px">
-        每个域名：重置网络 → 基线 10 秒 → 访问 → 等 3 秒 → 验证 10 秒。低于触发线判「无效」，命中后每 10 秒复测一次，直到回落或到回落上限；命中即停。
-      </div>
-      <div class="note" id="probePrompt" style="display:none;border-color:var(--warn);color:var(--warn)">
-        <b id="promptText">请现在打开飞行模式，10 秒后关闭。</b>
-        <div class="btns" style="margin-top:10px"><button id="btnProbeAck">网络已恢复，继续</button></div>
+        开测先确认已限速（&lt; 限速线）；没限速就每 15 秒测一次等它回落，最多 10 分钟。之后逐个访问链接：测 10 秒，≤ 加速线判「无效」；&gt; 加速线就持续监控到掉回限速线以下，记录存活时长。全部跑完才结束。
       </div>
       <div class="logwrap" style="margin-top:10px;max-height:300px">
         <table>
-          <thead><tr><th>域名</th><th>基线</th><th>触发后</th><th>存活</th><th>判定</th></tr></thead>
-          <tbody id="probeBody"><tr><td colspan="5" class="empty">还没有测试</td></tr></tbody>
+          <thead><tr><th>域名</th><th>访问后</th><th>存活</th><th>判定</th></tr></thead>
+          <tbody id="probeBody"><tr><td colspan="4" class="empty">还没有测试</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -424,13 +420,17 @@
 
   // ---------- 命中测试（桌面版 / 安卓版共用界面） ----------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const SPEED_SECONDS = 10;   // 每次测速时长
-  const VISIT_WAIT = 3000;    // 访问后等多久再验证
-  const RESET_WAIT = 5000;    // 网络重置后的等待（桌面版没有飞行模式，只等一下）
+  const SPEED_SECONDS = 10;      // 每次测速 10 秒
+  const VISIT_WAIT = 3000;       // 访问后等 3 秒再测
+  const MONITOR_GAP = 5000;      // 每轮之间等 5 秒
+  const MONITOR_CAP = 1800;      // 单次监控最多 30 分钟（安全上限）
   const FIXED_PIN = "__fixed__"; // 全程用同一批测速文件 = 固定测速节点
 
   // 桌面模式下这份状态由 JS 自己维护；安卓模式下来自原生快照
-  const probe = { running: false, index: 0, total: 0, current: "", doneAt: 0, results: [], hit: "", needAck: false };
+  const probe = {
+    running: false, index: 0, total: 0, current: "", doneAt: 0,
+    results: [], base: 0, best: null, notThrottled: false,
+  };
 
   function setupProbe() {
     const pc = document.getElementById("probeCard");
@@ -440,19 +440,19 @@
 
     const limitEl = document.getElementById("pLimit");
     const fastEl = document.getElementById("pFast");
-    const maxEl = document.getElementById("pMax");
+    const waitEl = document.getElementById("pWait");
     const srcEl = document.getElementById("pSrc");
 
     document.getElementById("btnProbe").addEventListener("click", () => {
       saveCfg();
-      const limit = parseFloat(limitEl.value) || 1;
-      const fast = parseFloat(fastEl.value) || 2;
-      const maxSec = num(maxEl.value, 180);
+      const limitKBs = parseFloat(limitEl.value) || 650;
+      const fastMBs = parseFloat(fastEl.value) || 2;
+      const waitMin = num(waitEl.value, 10);
       const src = (srcEl && srcEl.value) || "public";
       if (NATIVE) {
-        bridge("startProbe", JSON.stringify(cfg.targets), limit, fast, maxSec, src);
+        bridge("startProbe", JSON.stringify(cfg.targets), limitKBs, fastMBs, waitMin, src);
       } else {
-        startProbeDesktop(limit, fast, maxSec, src);
+        startProbeDesktop(limitKBs, fastMBs, waitMin, src);
       }
     });
 
@@ -463,17 +463,17 @@
       renderProbe(probe);
     });
 
-    document.getElementById("btnProbeAck").addEventListener("click", () => {
-      if (NATIVE) { bridge("probeAck"); return; }
-      probe.ackAt = Date.now();
-    });
-
     document.getElementById("btnApplyHit").addEventListener("click", applyHitKeepalive);
   }
 
   function probeHint(text) {
     const st = document.getElementById("probeStatus");
     if (st) st.textContent = text;
+  }
+
+  function fmtClock(sec) {
+    const s = Math.max(0, Math.round(sec));
+    return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
   }
 
   /** 调一次测速，返回 MB/s（失败返回 -1） */
@@ -497,7 +497,32 @@
     return -1;
   }
 
-  async function startProbeDesktop(limit, fast, maxSec, src) {
+  /**
+   * 反复测速直到 < limitMBs（回到被限速状态）。
+   * 每轮「测 10 秒 + 等 5 秒」，最多 minutes 分钟。
+   * 返回最后一次的值；超时仍 ≥ 线，或测不到（-1）。
+   */
+  async function waitThrottled(src, limitMBs, minutes, label) {
+    const deadline = Date.now() + minutes * 60000;
+    let v = await measure(src);
+    while (probe.running && v >= limitMBs && Date.now() < deadline) {
+      probe.current = `${label} · 等回落 ${fmtClock((deadline - Date.now()) / 1000)} · 当前 ${v.toFixed(2)} MB/s`;
+      renderProbe(probe);
+      await sleep(MONITOR_GAP);
+      if (!probe.running) break;
+      v = await measure(src);
+    }
+    return v;
+  }
+
+  function finishProbe() {
+    probe.running = false;
+    probe.current = "";
+    probe.doneAt = Date.now();
+    renderProbe(probe);
+  }
+
+  async function startProbeDesktop(limitKBs, fastMBs, waitMin, src) {
     if (probe.running) return;
     if (!state.proxy) {
       probeHint("桌面版测速需要本地代理：先双击 start.bat（或 node server.js），再从 http://127.0.0.1:8787 打开本页。");
@@ -506,6 +531,8 @@
     const list = cfg.targets.slice();
     if (!list.length) return;
 
+    const limitMBs = Math.max(0.01, limitKBs / 1000);
+
     // 必须在点击手势里开窗，否则会被浏览器拦截
     if (cfg.preview && (!state.viewer || state.viewer.closed)) openViewer();
 
@@ -513,38 +540,50 @@
     probe.results = [];
     probe.index = 0;
     probe.total = list.length;
-    probe.current = src === "public" ? "准备测速源（首次约 15 秒）…" : "";
+    probe.current = "开测检查：测速 10 秒…";
     probe.doneAt = 0;
-    probe.hit = "";
-    probe.needAck = false;
+    probe.base = 0;
+    probe.best = null;
+    probe.notThrottled = false;
+    probe.waitMin = waitMin;
     renderProbe(probe);
+
+    // 1. 先确认处在限速状态
+    const v0 = await waitThrottled(src, limitMBs, waitMin, "开测检查");
+    if (!probe.running) { finishProbe(); return; }
+    if (v0 < 0) {
+      probeHint("测速一直失败，先检查网络或换个测速源。");
+      finishProbe();
+      return;
+    }
+    probe.base = v0;
+    if (v0 >= limitMBs) {
+      // 等了 waitMin 分钟还没回落
+      probe.notThrottled = true;
+      finishProbe();
+      return;
+    }
+
+    let last = v0;
 
     for (let i = 0; i < list.length; i++) {
       if (!probe.running) break;
       const url = list[i];
       probe.index = i + 1;
 
-      // 1. 重置网络，回到被限速的基线（桌面版没有蜂窝，只等一会儿）
-      probe.current = `重置网络，等 ${RESET_WAIT / 1000} 秒…`;
-      renderProbe(probe);
-      await sleep(RESET_WAIT);
-      if (!probe.running) break;
-
-      // 2. 基线
-      probe.current = `基线测速 ${SPEED_SECONDS} 秒…`;
-      renderProbe(probe);
-      let base = await measure(src);
-      if (!probe.running) break;
-      if (base >= fast) {
-        probe.current = "基线偏高，等 30 秒重测…";
-        renderProbe(probe);
-        await sleep(30000);
+      // 上一条结束时还在灰区（限速线 ~ 加速线之间），先等回落
+      if (last >= limitMBs) {
+        const v = await waitThrottled(src, limitMBs, waitMin, `第 ${i + 1} 个链接前等待`);
         if (!probe.running) break;
-        base = await measure(src);
+        if (v >= limitMBs) {
+          probe.notThrottled = true;
+          break;
+        }
+        last = v;
       }
 
-      // 3. 访问目标
-      probe.current = "访问中…";
+      // 2. 访问目标
+      probe.current = `第 ${i + 1}/${list.length} 个 · 访问中…`;
       renderProbe(probe);
       if (cfg.preview && isPageUrl(url)) visitViewer(url);
 
@@ -570,54 +609,68 @@
       }
 
       if (status < 200 || status >= 400) {
-        probe.results.push({ url, status, base, after: 0, alive: 0, verdict: "fail" });
+        probe.results.push({ url, status, after: 0, alive: 0, verdict: "fail" });
         renderProbe(probe);
         continue;
       }
 
-      // 4. 验证是否解速
-      probe.current = `等 ${VISIT_WAIT / 1000} 秒后验证…`;
+      // 3. 等 3 秒再测（加速的起点从这一刻算）
+      const hitStart = Date.now();
+      probe.current = `第 ${i + 1}/${list.length} 个 · 等 3 秒…`;
       renderProbe(probe);
       await sleep(VISIT_WAIT);
       if (!probe.running) break;
 
-      probe.current = `验证测速 ${SPEED_SECONDS} 秒…`;
+      probe.current = `第 ${i + 1}/${list.length} 个 · 测速 10 秒…`;
       renderProbe(probe);
-      const after = await measure(src);
+      const v1 = await measure(src);
+      if (!probe.running) break;
 
-      if (after < limit) {
-        probe.results.push({ url, status, base, after, alive: 0, verdict: "miss" });
+      if (v1 < 0) {
+        probe.results.push({ url, status, after: 0, alive: 0, verdict: "fail" });
         renderProbe(probe);
+        last = limitMBs; // 不确定状态，下一条前先等回落
         continue;
       }
 
-      // 5. 命中：连续复测（每次 10 秒），按真实时间算存活
-      const hitAt = Date.now();
-      let alive = 0;
-      while (probe.running) {
-        probe.current = `🔥 已解速 · 监控中 ${alive}s / ${maxSec}s`;
+      // 4. 没超过加速线 → 无效
+      if (v1 <= fastMBs) {
+        probe.results.push({ url, status, after: v1, alive: 0, verdict: "miss" });
         renderProbe(probe);
+        last = v1;
+        continue;
+      }
+
+      // 5. 解除了：一直监控到掉回限速线以下
+      let cur = v1;
+      while (probe.running) {
+        const alive = Math.round((Date.now() - hitStart) / 1000);
+        probe.current = `🔥 已解除限速 · 监控 ${fmtClock(alive)} · 当前 ${cur.toFixed(2)} MB/s`;
+        renderProbe(probe);
+        if (alive >= MONITOR_CAP) break;
+        await sleep(MONITOR_GAP);
+        if (!probe.running) break;
         const v = await measure(src);
-        alive = Math.round((Date.now() - hitAt) / 1000);
-        if (v < limit || alive >= maxSec) break;
+        if (v < 0) continue; // 这次没测到，跳过
+        cur = v;
+        if (v < limitMBs) break;
       }
       if (!probe.running) break;
 
-      probe.hit = url;
-      probe.results.push({ url, status, base, after, alive, verdict: "hit" });
+      const alive = Math.round((Date.now() - hitStart) / 1000);
+      probe.results.push({ url, status, after: v1, alive, verdict: "hit" });
+      if (!probe.best || alive > probe.best.alive) probe.best = { url, alive };
       renderProbe(probe);
-      break; // 抓到了就收工
+      last = cur;
     }
 
-    probe.running = false;
-    probe.current = "";
-    probe.doneAt = Date.now();
-    renderProbe(probe);
+    finishProbe();
   }
 
-  /** 用命中的域名套用保活参数：只留它、50 秒间隔、±3 秒抖动 */
+  /** 用存活最长的命中域名套用保活参数：只留它、50 秒间隔、±3 秒抖动 */
   function applyHitKeepalive() {
-    const url = probe.hit || (lastProbe && lastProbe.hit) || "";
+    const best = probe.best || (lastProbe && lastProbe.best) || null;
+    const url = best && best.url ? best.url : "";
     if (!url) { probeHint("还没有命中任何域名。"); return; }
     cfg.targets = [url];
     cfg.interval = 50;
@@ -633,7 +686,7 @@
       // 直接用新参数开跑（没在跑就启动，在跑就按新配置重启循环）
       bridge("start", cfg.interval, cfg.jitter, cfg.burst, JSON.stringify(cfg.targets));
     }
-    probeHint(`已套用保活参数：${url.replace(/^https?:\/\//, "")} · 每 50 秒 ±3 秒`);
+    probeHint(`已套用保活参数：${url.replace(/^https?:\/\//, "")} · 每 50 秒 ±3 秒（存活 ${best.alive} 秒）`);
   }
 
   function currentProbeList() {
@@ -761,35 +814,37 @@
     const st = document.getElementById("probeStatus");
     const list = p.results || [];
 
-    // 手动重置网络时的提示
-    const promptEl = document.getElementById("probePrompt");
-    if (promptEl) promptEl.style.display = p.needAck ? "" : "none";
-
-    const hitRow = list.find((r) => r.verdict === "hit") || (p.hit ? { url: p.hit, alive: 0 } : null);
+    const best = p.best || null;
     const applyBtn = document.getElementById("btnApplyHit");
-    if (applyBtn) applyBtn.style.display = hitRow ? "" : "none";
+    if (applyBtn) applyBtn.style.display = best && best.url ? "" : "none";
 
     if (st && (p.running || p.doneAt)) {
       if (p.running) {
-        st.textContent = `测试中 ${p.index}/${p.total} · ${p.current || ""}`;
-      } else if (hitRow) {
-        st.textContent = `🏁 命中：${shortUrl(hitRow.url)} · 存活约 ${hitRow.alive || 0} 秒（点「套用保活参数」直接切过去）`;
+        st.textContent = p.index > 0
+          ? `测试中 ${p.index}/${p.total} · ${p.current || ""}`
+          : (p.current || "准备中…");
+      } else if (p.notThrottled) {
+        st.textContent = `当前没被限速（${(Number(p.base) || 0).toFixed(2)} MB/s），等了 ${p.waitMin || 10} 分钟还没回落到限速线以下，测不出差别。` +
+          "先确认手机/热点确实被限速了再试。";
       } else {
+        const hits = list.filter((r) => r.verdict === "hit").length;
         const miss = list.filter((r) => r.verdict === "miss").length;
         const fail = list.filter((r) => r.verdict === "fail").length;
-        st.textContent = `测试完成：${list.length} 个域名都没触发解速（无效 ${miss} · 失败 ${fail}）。`;
+        st.textContent = best
+          ? `测试完成：命中 ${hits} 个，最长的是 ${shortUrl(best.url)}（存活 ${best.alive} 秒）· 无效 ${miss} · 失败 ${fail}。`
+          : `测试完成：${list.length} 个链接都没触发解速（无效 ${miss} · 失败 ${fail}）。`;
       }
     }
 
     if (!p.running && !p.doneAt && !list.length) return;
 
-    const sig = list.map((r) => `${r.url}|${r.base}|${r.after}|${r.alive}|${r.verdict}`).join("|");
+    const sig = list.map((r) => `${r.url}|${r.after}|${r.alive}|${r.verdict}`).join("|");
     if (sig === probeSig) return;
     probeSig = sig;
 
     tb.textContent = "";
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="5" class="empty">还没有测试</td></tr>';
+      tb.innerHTML = '<tr><td colspan="4" class="empty">还没有测试</td></tr>';
       return;
     }
     const label = { hit: "命中", miss: "无效", fail: "失败" };
@@ -799,7 +854,6 @@
       const tr = document.createElement("tr");
       tr.innerHTML =
         `<td class="u" title="${String(r.url).replace(/"/g, "&quot;")}">${shortUrl(r.url)}</td>` +
-        `<td class="mono">${fmt(r.base)}</td>` +
         `<td class="mono">${fmt(r.after)}</td>` +
         `<td class="mono">${r.alive > 0 ? r.alive + "s" : "—"}</td>` +
         `<td class="mono ${cls}">${label[r.verdict] || r.verdict}</td>`;

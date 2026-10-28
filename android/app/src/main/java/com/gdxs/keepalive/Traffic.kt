@@ -63,12 +63,13 @@ object Traffic {
     @Volatile var probeCurrent = ""
     @Volatile var probePhase = ""
     @Volatile var probeDoneAt = 0L
-    @Volatile var limitMBs = 1.0      // 触发线
-    @Volatile var fastMBs = 2.0       // 加速线（基线高于它就先等一等）
-    @Volatile var maxAlive = 180      // 回落监控上限（秒）
-    @Volatile var needResetAck = false // 需要用户手动恢复网络
-    @Volatile var resetAck = 0
-    @Volatile var probeHit = ""
+    @Volatile var limitKBs = 650.0    // 限速线：低于它才算「被限速」
+    @Volatile var fastMBs = 2.0       // 加速线：高于它才算「解除限速」
+    @Volatile var waitMin = 10        // 开测等待回落的上限（分钟）
+    @Volatile var baseMBs = 0.0       // 开测检查测到的基线
+    @Volatile var notThrottled = false
+    @Volatile var bestUrl = ""
+    @Volatile var bestAlive = 0
     @Volatile var speedSource = "public"
     @Volatile var targetsVersion = 0
 
@@ -167,27 +168,25 @@ object Traffic {
         probeTotal = total
         probeCurrent = ""
         probePhase = ""
-        probeHit = ""
-        needResetAck = false
         probeDoneAt = 0L
+        baseMBs = 0.0
+        notThrottled = false
+        bestUrl = ""
+        bestAlive = 0
     }
 
-    fun probeAdd(
-        url: String,
-        status: Int,
-        baseMBs: Double,
-        afterMBs: Double,
-        alive: Int,
-        verdict: String
-    ) {
+    fun probeAdd(url: String, status: Int, afterMBs: Double, alive: Int, verdict: String) {
         val o = JSONObject()
             .put("url", url)
             .put("status", status)
-            .put("base", Math.round(baseMBs * 100.0) / 100.0)
             .put("after", Math.round(afterMBs * 100.0) / 100.0)
             .put("alive", alive)
             .put("verdict", verdict)
         synchronized(probeLock) { probeResults.addLast(o.toString()) }
+        if (verdict == "hit" && alive > bestAlive) {
+            bestAlive = alive
+            bestUrl = url
+        }
     }
 
     fun probeJson(): JSONObject {
@@ -197,12 +196,14 @@ object Traffic {
             .put("total", probeTotal)
             .put("current", probePhase.ifEmpty { probeCurrent })
             .put("doneAt", probeDoneAt)
-            .put("limit", limitMBs)
-            .put("fast", fastMBs)
-            .put("maxAlive", maxAlive)
-            .put("hit", probeHit)
-            .put("needAck", needResetAck)
+            .put("base", baseMBs)
+            .put("waitMin", waitMin)
+            .put("notThrottled", notThrottled)
+            .put("bestUrl", bestUrl)
+            .put("bestAlive", bestAlive)
         val arr = JSONArray()
+        val best = JSONObject().put("url", bestUrl).put("alive", bestAlive)
+        p.put("best", if (bestUrl.isEmpty()) JSONObject.NULL else best)
         synchronized(probeLock) { for (line in probeResults) arr.put(JSONObject(line)) }
         p.put("results", arr)
         return p

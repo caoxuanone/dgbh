@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import org.json.JSONArray
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -40,6 +41,8 @@ class TrafficService : Service() {
         private const val PREFS = "gdxs"
         // 全程固定同一批测速文件，等于固定测速节点
         private const val FIXED_PIN = "__fixed__"
+        private const val MONITOR_GAP = 5000L   // 每轮之间等 5 秒
+        private const val MONITOR_CAP = 1800    // 单次监控最多 30 分钟
     }
 
     private lateinit var scheduler: ScheduledExecutorService
@@ -127,9 +130,9 @@ class TrafficService : Service() {
             }
 
             ACTION_PROBE -> {
-                Traffic.limitMBs = intent.getDoubleExtra("limit", 1.0)
-                Traffic.fastMBs = intent.getDoubleExtra("fast", 2.0)
-                Traffic.maxAlive = intent.getIntExtra("maxAlive", 180).coerceIn(20, 600)
+                Traffic.limitKBs = intent.getDoubleExtra("limitKBs", 650.0)
+                Traffic.fastMBs = intent.getDoubleExtra("fastMBs", 2.0)
+                Traffic.waitMin = intent.getIntExtra("waitMin", 10).coerceIn(1, 60)
                 Traffic.speedSource = intent.getStringExtra("src") ?: "public"
                 val list = Traffic.parseTargets(intent.getStringExtra("targets"))
                 startForegroundCompat()
@@ -249,31 +252,28 @@ class TrafficService : Service() {
     }
 
     /**
-     * 重置网络，回到被限速的基线。
-     * 有 root 就自动切飞行模式；没有就弹提示等用户手动确认。
+     * 反复测速，直到 < limitMBs（回到被限速状态）。
+     * 每轮「测 10 秒 + 等 5 秒」，最多 Traffic.waitMin 分钟。
      */
-    private fun resetNetwork() {
-        if (NetReset.hasRoot()) {
-            Traffic.probePhase = "重置网络（飞行模式 10 秒）…"
+    private fun waitThrottled(limitMBs: Double, label: String): Double {
+        val deadline = System.currentTimeMillis() + Traffic.waitMin * 60_000L
+        var v = measureMBs()
+        while (Traffic.probing && v >= limitMBs && System.currentTimeMillis() < deadline) {
+            val left = ((deadline - System.currentTimeMillis()) / 1000).toInt()
+            Traffic.probePhase =
+                "$label · 等回落 ${fmtClock(left)} · 当前 ${fmtSpeed(v)} MB/s"
             updateNotification()
-            if (NetReset.cycle()) {
-                Thread.sleep(5000)
-                return
-            }
+            Thread.sleep(MONITOR_GAP)
+            if (!Traffic.probing) break
+            v = measureMBs()
         }
-
-        Traffic.needResetAck = true
-        Traffic.probePhase = "请打开飞行模式，10 秒后关闭，再点「网络已恢复」"
-        updateNotification()
-        val ack0 = Traffic.resetAck
-        var waited = 0
-        while (Traffic.probing && Traffic.resetAck == ack0 && waited < 120_000) {
-            Thread.sleep(500)
-            waited += 500
-        }
-        Traffic.needResetAck = false
-        Thread.sleep(5000)
+        return v
     }
+
+    private fun fmtClock(sec: Int): String =
+        "${sec / 60}:${String.format(Locale.CHINA, "%02d", sec % 60)}"
+
+    private fun fmtSpeed(v: Double): String = String.format(Locale.CHINA, "%.2f", v)
 
     private fun startProbe(list: List<String>) {
         if (Traffic.probing) return
@@ -283,7 +283,7 @@ class TrafficService : Service() {
 
         probeWorker.execute {
             try {
-                // 先把公共测速源体检一遍，免得第一次「基线测速」里偷偷多花 20 秒
+                // 先把公共测速源体检一遍，免得第一次测速里偷偷多花 20 秒
                 if (Traffic.speedSource == "public") {
                     Traffic.probePhase = "准备测速源…"
                     updateNotification()
@@ -293,79 +293,113 @@ class TrafficService : Service() {
                     }
                 }
 
-                for (i in targets.indices) {
-                    if (!Traffic.probing) break
-                    val url = targets[i]
-                    Traffic.probeIndex = i + 1
-                    Traffic.probeCurrent = url
+                val limitMBs = maxOf(0.01, Traffic.limitKBs / 1000.0)
+                var abort = false
 
-                    // 1. 重置网络，回到被限速的基线
-                    resetNetwork()
-                    if (!Traffic.probing) break
-
-                    // 2. 基线
-                    Traffic.probePhase = "基线测速 10 秒…"
+                // 1. 开测检查：确认现在是被限速状态
+                Traffic.probePhase = "开测检查：测速 10 秒…"
+                updateNotification()
+                val v0 = waitThrottled(limitMBs, "开测检查")
+                if (!Traffic.probing) {
+                    abort = true
+                } else if (v0 < 0) {
+                    Traffic.probePhase = "测速一直失败，先检查网络或换个测速源"
                     updateNotification()
-                    var base = measureMBs()
-                    if (!Traffic.probing) break
-                    if (base >= Traffic.fastMBs) {
-                        Traffic.probePhase = "基线偏高，等 30 秒重测…"
-                        updateNotification()
-                        sleepWhileProbing(30_000)
+                    Thread.sleep(3000)
+                    abort = true
+                } else {
+                    Traffic.baseMBs = v0
+                    if (v0 >= limitMBs) {
+                        Traffic.notThrottled = true
+                        abort = true
+                    }
+                }
+
+                var last = if (abort) 0.0 else v0
+
+                if (!abort) {
+                    for (i in targets.indices) {
                         if (!Traffic.probing) break
-                        base = measureMBs()
-                    }
+                        val url = targets[i]
+                        Traffic.probeIndex = i + 1
+                        Traffic.probeCurrent = url
 
-                    // 3. 访问目标
-                    Traffic.probePhase = "访问中…"
-                    updateNotification()
-                    val r = Traffic.fetch(url)
-                    Traffic.record(url, r)
+                        // 上一条结束时还在灰区，先等回落
+                        if (last >= limitMBs) {
+                            val v = waitThrottled(limitMBs, "第 ${i + 1} 个链接前等待")
+                            if (!Traffic.probing) break
+                            if (v >= limitMBs) {
+                                Traffic.notThrottled = true
+                                break
+                            }
+                            last = v
+                        }
 
-                    if (r.status !in 200..399) {
-                        Traffic.probeAdd(url, r.status, base, 0.0, 0, "fail")
+                        // 2. 访问目标
+                        Traffic.probePhase = "访问中…"
                         updateNotification()
-                        continue
-                    }
+                        val r = Traffic.fetch(url)
+                        Traffic.record(url, r)
 
-                    // 4. 等 3 秒再验证
-                    Traffic.probePhase = "等 3 秒…"
-                    updateNotification()
-                    sleepWhileProbing(3000)
-                    if (!Traffic.probing) break
+                        if (r.status !in 200..399) {
+                            Traffic.probeAdd(url, r.status, 0.0, 0, "fail")
+                            updateNotification()
+                            continue
+                        }
 
-                    Traffic.probePhase = "验证测速 10 秒…"
-                    updateNotification()
-                    val after = measureMBs()
-                    if (after < Traffic.limitMBs) {
-                        Traffic.probeAdd(url, r.status, base, after, 0, "miss")
+                        // 3. 等 3 秒再测（加速起点从这里算）
+                        val hitStart = System.currentTimeMillis()
+                        Traffic.probePhase = "等 3 秒…"
                         updateNotification()
-                        continue
-                    }
+                        sleepWhileProbing(3000)
+                        if (!Traffic.probing) break
 
-                    // 5. 命中：连续复测，按真实时间算存活
-                    val hitAt = System.currentTimeMillis()
-                    var alive = 0
-                    while (Traffic.probing) {
-                        Traffic.probePhase = "已解速 · 监控中 ${alive}s / ${Traffic.maxAlive}s"
+                        Traffic.probePhase = "测速 10 秒…"
                         updateNotification()
-                        val v = measureMBs()
-                        alive = ((System.currentTimeMillis() - hitAt) / 1000).toInt()
-                        if (v < Traffic.limitMBs || alive >= Traffic.maxAlive) break
-                    }
-                    if (!Traffic.probing) break
+                        val v1 = measureMBs()
+                        if (!Traffic.probing) break
 
-                    Traffic.probeHit = url
-                    Traffic.probeAdd(url, r.status, base, after, alive, "hit")
-                    updateNotification()
-                    break // 抓到了就收工
+                        if (v1 < 0) {
+                            Traffic.probeAdd(url, r.status, 0.0, 0, "fail")
+                            last = limitMBs
+                            continue
+                        }
+
+                        // 4. 没超过加速线 → 无效
+                        if (v1 <= Traffic.fastMBs) {
+                            Traffic.probeAdd(url, r.status, v1, 0, "miss")
+                            last = v1
+                            continue
+                        }
+
+                        // 5. 解除了：一直监控到掉回限速线以下
+                        var cur = v1
+                        while (Traffic.probing) {
+                            val alive = ((System.currentTimeMillis() - hitStart) / 1000).toInt()
+                            Traffic.probePhase =
+                                "已解除限速 · 监控 ${fmtClock(alive)} · 当前 ${fmtSpeed(cur)} MB/s"
+                            updateNotification()
+                            if (alive >= MONITOR_CAP) break
+                            Thread.sleep(MONITOR_GAP)
+                            if (!Traffic.probing) break
+                            val v = measureMBs()
+                            if (v < 0) continue
+                            cur = v
+                            if (v < limitMBs) break
+                        }
+                        if (!Traffic.probing) break
+
+                        val alive = ((System.currentTimeMillis() - hitStart) / 1000).toInt()
+                        Traffic.probeAdd(url, r.status, v1, alive, "hit")
+                        updateNotification()
+                        last = cur
+                    }
                 }
             } catch (_: InterruptedException) {
             } finally {
                 Traffic.probePhase = ""
                 Traffic.probing = false
                 Traffic.probeCurrent = ""
-                Traffic.needResetAck = false
                 Traffic.probeDoneAt = System.currentTimeMillis()
                 save()
 
