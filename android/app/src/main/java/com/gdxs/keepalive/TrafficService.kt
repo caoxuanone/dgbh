@@ -342,7 +342,7 @@ class TrafficService : Service() {
                         Traffic.record(url, r)
 
                         if (r.status !in 200..399) {
-                            Traffic.probeAdd(url, r.status, 0.0, 0, "fail")
+                            Traffic.probeAdd(url, r.status, 0.0, emptyList(), 0, "fail")
                             updateNotification()
                             continue
                         }
@@ -354,20 +354,28 @@ class TrafficService : Service() {
                         sleepWhileProbing(3000)
                         if (!Traffic.probing) break
 
-                        Traffic.probePhase = "测速 10 秒…"
-                        updateNotification()
-                        val v1 = measureMBs()
+                        // 连测 3 次，取最大值判定（提速是慢慢爬上去的，单次容易漏）
+                        val runs = ArrayList<Double>()
+                        for (k in 0 until 3) {
+                            if (!Traffic.probing) break
+                            Traffic.probePhase = "第 ${k + 1}/3 次测速…"
+                            updateNotification()
+                            runs.add(measureMBs())
+                        }
                         if (!Traffic.probing) break
 
+                        val valid = runs.filter { it >= 0 }
+                        val v1 = if (valid.isEmpty()) -1.0 else valid.max()
+
                         if (v1 < 0) {
-                            Traffic.probeAdd(url, r.status, 0.0, 0, "fail")
+                            Traffic.probeAdd(url, r.status, 0.0, runs, 0, "fail")
                             last = limitMBs
                             continue
                         }
 
-                        // 4. 没超过加速线 → 无效
+                        // 4. 3 次都没超过加速线 → 无效
                         if (v1 <= Traffic.fastMBs) {
-                            Traffic.probeAdd(url, r.status, v1, 0, "miss")
+                            Traffic.probeAdd(url, r.status, v1, runs, 0, "miss")
                             last = v1
                             continue
                         }
@@ -390,7 +398,7 @@ class TrafficService : Service() {
                         if (!Traffic.probing) break
 
                         val alive = ((System.currentTimeMillis() - hitStart) / 1000).toInt()
-                        Traffic.probeAdd(url, r.status, v1, alive, "hit")
+                        Traffic.probeAdd(url, r.status, v1, runs, alive, "hit")
                         updateNotification()
                         last = cur
                     }

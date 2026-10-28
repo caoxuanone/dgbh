@@ -175,11 +175,19 @@ object Traffic {
         bestAlive = 0
     }
 
-    fun probeAdd(url: String, status: Int, afterMBs: Double, alive: Int, verdict: String) {
+    fun probeAdd(
+        url: String,
+        status: Int,
+        afterMBs: Double,
+        runs: List<Double>,
+        alive: Int,
+        verdict: String
+    ) {
         val o = JSONObject()
             .put("url", url)
             .put("status", status)
             .put("after", Math.round(afterMBs * 100.0) / 100.0)
+            .put("runs", JSONArray(runs.map { Math.round(it * 100.0) / 100.0 }))
             .put("alive", alive)
             .put("verdict", verdict)
         synchronized(probeLock) { probeResults.addLast(o.toString()) }

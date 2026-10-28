@@ -185,7 +185,7 @@
         </select>
       </label>
       <div class="note" style="margin-top:0;padding:8px 11px">
-        固定参数：每次测速 <b>10 秒</b> · 访问后等 <b>3 秒</b> · 监控间隔 <b>5 秒</b> · 单次监控上限 <b>30 分钟</b> · 命中后保活 <b>50 秒 ±3</b>
+        固定参数：每次测速 <b>10 秒</b> · 访问后连测 <b>3 次</b>取最高 · 等 <b>3 秒</b> 开始 · 监控间隔 <b>5 秒</b> · 单次监控上限 <b>30 分钟</b> · 命中后保活 <b>50 秒 ±3</b>
       </div>
       <div class="note" id="probeStatus" style="margin-top:12px">
         开测先确认已限速（&lt; 限速线）；没限速就每 15 秒测一次等它回落，最多 10 分钟。之后逐个访问链接：测 10 秒，≤ 加速线判「无效」；&gt; 加速线就持续监控到掉回限速线以下，记录存活时长。全部跑完才结束。
@@ -624,21 +624,29 @@
       await sleep(VISIT_WAIT);
       if (!probe.running) break;
 
-      probe.current = `第 ${i + 1}/${list.length} 个 · 测速 10 秒…`;
-      renderProbe(probe);
-      const v1 = await measure(src);
+      // 连测 3 次，取最大值判定（提速是慢慢爬上去的，单次容易漏）
+      const runs = [];
+      for (let k = 0; k < 3; k++) {
+        if (!probe.running) break;
+        probe.current = `第 ${i + 1}/${list.length} 个 · 第 ${k + 1}/3 次测速…`;
+        renderProbe(probe);
+        runs.push(await measure(src));
+      }
       if (!probe.running) break;
 
+      const valid = runs.filter((v) => v >= 0);
+      const v1 = valid.length ? Math.max(...valid) : -1;
+
       if (v1 < 0) {
-        probe.results.push({ url, status, after: 0, alive: 0, verdict: "fail" });
+        probe.results.push({ url, status, after: 0, runs, alive: 0, verdict: "fail" });
         renderProbe(probe);
         last = limitMBs; // 不确定状态，下一条前先等回落
         continue;
       }
 
-      // 4. 没超过加速线 → 无效
+      // 4. 3 次都没超过加速线 → 无效
       if (v1 <= fastMBs) {
-        probe.results.push({ url, status, after: v1, alive: 0, verdict: "miss" });
+        probe.results.push({ url, status, after: v1, runs, alive: 0, verdict: "miss" });
         renderProbe(probe);
         last = v1;
         continue;
@@ -661,7 +669,7 @@
       if (!probe.running) break;
 
       const alive = Math.round((Date.now() - hitStart) / 1000);
-      probe.results.push({ url, status, after: v1, alive, verdict: "hit" });
+      probe.results.push({ url, status, after: v1, runs, alive, verdict: "hit" });
       if (!probe.best || alive > probe.best.alive) probe.best = { url, alive };
       renderProbe(probe);
       last = cur;
@@ -854,10 +862,13 @@
     const fmt = (v) => (v > 0 ? Number(v).toFixed(2) : "—");
     for (const r of list) {
       const cls = r.verdict === "hit" ? "s-ok" : (r.verdict === "fail" ? "s-bad" : "s-warn");
+      const runs = Array.isArray(r.runs) && r.runs.length
+        ? r.runs.map((v) => (v >= 0 ? Number(v).toFixed(2) : "×")).join(" / ")
+        : "";
       const tr = document.createElement("tr");
       tr.innerHTML =
         `<td class="u" title="${String(r.url).replace(/"/g, "&quot;")}">${shortUrl(r.url)}</td>` +
-        `<td class="mono">${fmt(r.after)}</td>` +
+        `<td class="mono" title="${runs ? "三次：" + runs + " MB/s" : ""}">${fmt(r.after)}</td>` +
         `<td class="mono">${r.alive > 0 ? r.alive + "s" : "—"}</td>` +
         `<td class="mono ${cls}">${label[r.verdict] || r.verdict}</td>`;
       tb.appendChild(tr);
