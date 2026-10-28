@@ -103,6 +103,7 @@
   td.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
   td.u{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c8d6ea}
   td.seg{font-family:var(--mono);font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+  td .runlist{font-family:var(--mono);font-size:10px;color:#5b6a80;font-variant-numeric:tabular-nums;margin-top:2px}
   .s-ok{color:var(--accent)}
   .s-warn{color:var(--warn)}
   .s-bad{color:var(--bad)}
@@ -863,12 +864,13 @@
     for (const r of list) {
       const cls = r.verdict === "hit" ? "s-ok" : (r.verdict === "fail" ? "s-bad" : "s-warn");
       const runs = Array.isArray(r.runs) && r.runs.length
-        ? r.runs.map((v) => (v >= 0 ? Number(v).toFixed(2) : "×")).join(" / ")
+        ? r.runs.map((v) => (v >= 0 ? Number(v).toFixed(2) : "×")).join("/")
         : "";
       const tr = document.createElement("tr");
       tr.innerHTML =
         `<td class="u" title="${String(r.url).replace(/"/g, "&quot;")}">${shortUrl(r.url)}</td>` +
-        `<td class="mono" title="${runs ? "三次：" + runs + " MB/s" : ""}">${fmt(r.after)}</td>` +
+        `<td class="mono" title="${runs ? "三次：" + runs + " MB/s" : ""}">${fmt(r.after)}` +
+        `${runs ? `<div class="runlist">${runs}</div>` : ""}</td>` +
         `<td class="mono">${r.alive > 0 ? r.alive + "s" : "—"}</td>` +
         `<td class="mono ${cls}">${label[r.verdict] || r.verdict}</td>`;
       tb.appendChild(tr);
